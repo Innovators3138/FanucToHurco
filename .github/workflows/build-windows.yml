@@ -1,0 +1,37 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:       # lets you trigger manually from the GitHub UI
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install PyQt6 matplotlib pyinstaller
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --windowed --name FanucToHurco `
+            --hidden-import mpl_toolkits.mplot3d `
+            --hidden-import matplotlib.backends.backend_qtagg `
+            main.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FanucToHurco-windows
+          path: dist/FanucToHurco.exe
+          retention-days: 30
