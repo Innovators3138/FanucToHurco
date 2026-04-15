@@ -1,0 +1,45 @@
+%
+O0001
+( POST FILE   : generic_fanuc.py )
+( POST VERSION: 1.213.695 )
+( CAM SYSTEM  : CamStudio, Version 1.213.2870.d7f9f7df3 )
+( CAM FILE    : 002 )
+( MACHINE     : 3AxGenericVertical-default )
+( CREATED ON  : 2026-04-15T02:39:31 )
+( CREATED BY  : MW PPFramework v2.15.0 )
+
+( --- TOOL LIST BEGIN --- )
+( --- Tooling parameters generated in 'Imperial' unit --- )
+( T1 D0.156 in A118 Drill, TL=3.5, CL=3.5, FL=3.0 )
+( --- TOOL LIST END --- )
+
+N1 G20
+N2 G0 G90 G17 G40 G49 G80
+( Operation: Drill )
+N3 T1 M6 (D0.156 in A118 Drill)
+N4 S6000 M3
+N5 G0 G90 G54 G94 ( Setup )
+N6 G0 X1.2027 Y2.2793
+N7 G43 Z0.5906 H01
+N8 G98 G81 X1.2027 Y2.2793 Z-0.25 R0.2 F59.0551
+N9 X1.18 Y1.2795
+N10 X1.1573 Y0.2798
+N11 X3.2405 Y1.2328
+N12 X5.3818 Y3.75
+N13 Y3.25
+N14 Y2.75
+N15 Y2.25
+N16 Y1.75
+N17 Y1.25
+N18 Y0.75
+N19 Y0.25
+N20 X6.5936 Y0.9375
+N21 X9.9468 Y1.2313
+N22 G80
+N23 G0 Z0.5906
+N24 G91 G28 Z0.
+N25 G28 Y0.
+N26 M5
+N27 G49
+N28 M30
+%
