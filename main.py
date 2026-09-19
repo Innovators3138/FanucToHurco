@@ -1,14 +1,31 @@
 #!/usr/bin/env python3
 """
 FanucToHurco  —  Fanuc G-code → Hurco BNC Converter + 3D Backplot
-Target hardware: AMTS BX-MPU retrofit on Hurco MB-1
+Target hardware: AMTS BX-MPU retrofit on Hurco KMB-1 / MB-1
+
+Converts "Generic 3-axis Fanuc" G-code (e.g. from Onshape CAM Studio) into the
+legacy Hurco KMB-1 / AMTS BX-MPU NC format described in the AMTS G-code sheet
+(Gcodes.pdf), then backplots the converted program in 3D.
+
+What the converter does
+  * Arc centers (I/J) converted to ABSOLUTE coordinates, and every arc block
+    carries X, Y, I and J even when the Fanuc file omitted them.
+  * Helical arcs get the K word (Z pitch per 360 degrees) the control needs.
+  * R-format arcs converted to I/J.  Helical arcs split into small pieces.
+  * Arcs in G18/G19 planes converted to short G01 moves.
+  * Incremental (G91) moves converted to absolute.
+  * G28/G53 Z retracts -> M25.  XY home moves dropped.
+  * Canned cycles expanded into plain moves (default, like the Fusion
+    hurcoBX.cps post) or rewritten using the Z-word templates below.
+  * Unsupported codes (G43 G49 G54 G94 G98 H D ...) removed and reported.
+  * Header/footer and N2, N4, ... numbering match the AMTS sample program.
 
 Output format (per AMTS BX-MPU spec / Gcodes.pdf sample):
-  %            ← first line, no N-number
-  N2G00        ← even N-numbers, N-number glued directly to code
+  %            <- first line, no N-number
+  N2G00        <- even N-numbers, N-number glued directly to code, no spaces
   N4G90
   ...
-  E            ← last line, no N-number
+  E            <- last line, no N-number
 
 Dependencies:
     pip install PyQt6 matplotlib
@@ -20,8 +37,10 @@ PyInstaller (single-file, no console window):
         main.py
 """
 
-import sys
+import math
 import re
+import sys
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 # matplotlib backend MUST be set before any other matplotlib imports
@@ -44,333 +63,728 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Valid Hurco BNC vocabulary  (Gcodes.pdf)
-# ─────────────────────────────────────────────────────────────────────────────
-VALID_G: set = {
-    'G00', 'G01', 'G02', 'G03', 'G04', 'G09',
-    'G17', 'G19',
-    'G40', 'G41', 'G42',
-    'G61', 'G64',
-    'G70', 'G71',
-    'G80', 'G81', 'G82', 'G83', 'G84', 'G85',
-    'G90', 'G91',
+# ═════════════════════════ MACHINE SETTINGS ═════════════════════════════════
+DEC = 4                 # decimals for X Y Z I J (inch)
+FEED_DEC = 1            # decimals for F
+N_START, N_STEP = 2, 2
+HELIX_MAX_DEG = 90.0    # helical arcs are split into pieces no bigger than this
+ARC_MAX_DEG = 360.0     # flat arcs: AMTS sample shows full circles are accepted
+LINEARIZE_TOL = 0.0005  # chord error when converting G18/G19 arcs to lines
+
+# Helical K word.  The Hurco BX/KMBX-1 control needs K on every G17 helical
+# arc: the Z travel per full 360-degree turn (the pitch).
+#   'signed'   -> negative when going down  (G75 mode, the power-up default)
+#   'unsigned' -> always positive           (G74 mode)
+#   None       -> no K (NOT recommended; Z motion goes wrong without it)
+HELIX_K = 'signed'
+
+# Canned cycles: which Z words follow "G8x X.. Y..".
+#   'R' = retract/rapid plane (absolute)   'Z' = final depth (absolute)
+#   'Q' = peck increment (positive number, times PECK_SIGN)
+# >>> CONFIRM ON THE MACHINE.  G83 taking three Z words is known; the ORDER
+# >>> below and the use of Z words for the other cycles are assumptions.
+CYCLE_TEMPLATES = {
+    81: ['R', 'Z'],
+    82: ['R', 'Z'],
+    83: ['R', 'Z', 'Q'],
+    84: ['R', 'Z'],
+    85: ['R', 'Z'],
 }
-VALID_M: set = {
-    'M00', 'M01', 'M02', 'M03', 'M04', 'M05',
-    'M06', 'M07', 'M08', 'M09', 'M25',
-}
-# G-codes stripped entirely (work offsets, tool-length comp)
-STRIP_G: set = {'G54', 'G55', 'G56', 'G57', 'G58', 'G59', 'G43'}
+PECK_SIGN = +1
+
+# How canned cycles are sent.
+#   'expand' -> write drilling as plain G00/G01 moves (what the proven Fusion
+#               hurcoBX.cps post does; it never sends G81-G85 to the control)
+#   'native' -> send G8x blocks using CYCLE_TEMPLATES above
+# G84 tapping is always sent native (it cannot be safely expanded).
+CYCLE_MODE = 'expand'
+PECK_CLEARANCE = 0.01   # expanded G83: rapid back down to this far above last peck
+
+KEEP_D_WORD = False     # hurcoBX.cps writes D on G41/G42; the AMTS sheet does not
+EMIT_G75 = False        # G75 is the power-up default per AMTS; not on its valid-code list
+MAX_TOOL = 24           # Hurco BX tool changer limit (hurcoBX.cps)
+RPM_RANGE = (60, 4000)  # Hurco BX spindle range (hurcoBX.cps)
+
+# Fanuc cycles with no Hurco equivalent are mapped to the nearest one (warned)
+CYCLE_MAP = {73: 83, 74: 84, 76: 85, 86: 85, 87: 85, 88: 85, 89: 85}
+
+ALLOWED_G = {0, 1, 2, 3, 4, 9, 17, 40, 41, 42, 61, 64, 70, 71, 75,
+             80, 81, 82, 83, 84, 85, 90}
+ALLOWED_M = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 25}
+
+BUFFER_CHARS = 20000    # control's program buffer; above this it must drip-feed
+# ════════════════════════════════════════════════════════════════════════════
+
+WORD = re.compile(r'([A-Z])\s*([-+]?(?:\d+\.?\d*|\.\d+))')
+EPS = 1e-6
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Module-level helpers  (used by both converter and backplot parser)
-# ─────────────────────────────────────────────────────────────────────────────
-def _word(line: str, letter: str) -> Optional[float]:
-    """First numeric value following *letter* in *line*, or None."""
-    m = re.search(rf'(?<![A-Za-z]){re.escape(letter)}([+-]?\d*\.?\d+)',
-                  line, re.IGNORECASE)
-    return float(m.group(1)) if m else None
+def fnum(v, dec=DEC):
+    s = f"{v:.{dec}f}".rstrip('0')
+    return '0.' if s == '-0.' else s
 
 
-def _all_z(line: str) -> List[float]:
-    """All Z-values in *line*, left-to-right."""
-    return [float(m.group(1))
-            for m in re.finditer(r'(?<![A-Za-z])Z([+-]?\d*\.?\d+)',
-                                 line, re.IGNORECASE)]
-
-
-def _fmt(v: float) -> str:
-    """Float → string with at least one decimal place, no trailing zeros."""
-    s = f'{v:.4f}'.rstrip('0')
-    if '.' not in s:
-        s += '.0'
-    elif s.endswith('.'):
-        s += '0'
-    return s
-
-
-def _has_g(line: str) -> bool:
-    """True if *line* contains at least one G-code word."""
-    return bool(re.search(r'(?<![A-Za-z\d])G\d+', line, re.IGNORECASE))
-
-
-def _strip_n(line: str) -> str:
-    """Remove a leading Fanuc N-number (e.g. 'N10 ' or 'N10')."""
-    return re.sub(r'^N\d+\s*', '', line, flags=re.IGNORECASE)
+def strip_comments(s):
+    s = re.sub(r'\(.*?\)', '', s)
+    return s.split(';', 1)[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Converter Engine
 # ─────────────────────────────────────────────────────────────────────────────
-class FanucConverter:
+class Converter:
     """
-    Converts Fanuc / Onshape G-code to Hurco BNC for the AMTS BX-MPU retrofit.
+    Fanuc -> Hurco BNC state machine.
 
-    Processing order per line:
-      1.  Strip bare % and O-number (program ID) lines
-      2.  Strip input N-numbers and (parenthesis) / ; comments
-      3.  G28 Z0  →  M25
-      4.  G80     →  clear modal canned-cycle state
-      5.  G20/G21 →  G70/G71
-      6.  Strip G54-G59, G43, H-words
-      7.  Modal canned-cycle continuation (position-only line while cycle active)
-      8.  Canned-cycle 3-Z rewrite for G81-G85 (sets modal cycle state)
-      9.  Decimal enforcement on bare-integer X / Y / Z
-      10. Split into one-G-code-per-line segments
-      11. Vocabulary validation
-
-    Output format:
-      %           first line
-      N2…         even N-numbers glued to content
-      E           last line
+    Tracks absolute position, modal motion/plane/units and canned-cycle state
+    so the output can be emitted in the one-G-code-per-block, absolute-only,
+    absolute-I/J form the BX-MPU expects.
     """
 
-    def __init__(self) -> None:
-        self.errors: List[str] = []
-        self.info:   List[str] = []
-        self._modal_cycle: Optional[Dict] = None  # active canned-cycle params
+    def __init__(self, helix_max=HELIX_MAX_DEG, metric=False):
+        self.helix_max = helix_max
+        self.body = []
+        self.n = N_START
+        self.warnings = OrderedDict()
+        self.pos = {'X': 0.0, 'Y': 0.0, 'Z': None}
+        self.absolute = True
+        self.ij_absolute_in = False
+        self.motion = 0
+        self.plane = 17
+        self.last_motion_out = None
+        self.last_feed_out = None
+        self.feed = None
+        self.cycle = None
+        self.cycle_return = 'init'
+        self.spindle_on = False
+        self.coolant_on = False
+        self.metric = metric
+        self.ended = False
+        self.last_block = None
+        self.lineno = 0
+        self.raw = {}
+        # header, as in the AMTS sample
+        self.emit(['G00'])
+        self.emit(['G90'])
+        if EMIT_G75:
+            self.emit(['G75'])   # multi-quadrant arcs; K is signed in this mode
+        self.emit(['G71' if metric else 'G70'])
+        self.emit_m25()
 
-    # ── Public ───────────────────────────────────────────────────────────────
-    def convert(self, fanuc: str) -> str:
-        self.errors, self.info = [], []
-        self._modal_cycle = None
+    # ---------------------------------------------------------------- output
+    def warn(self, msg):
+        self.warnings.setdefault(msg, []).append(self.lineno)
 
-        content: List[str] = []  # raw content lines before N-numbering
+    def emit(self, words):
+        block = ''.join(words)
+        if not block:
+            return
+        self.body.append(f"N{self.n}{block}")
+        self.n += N_STEP
+        self.last_block = block
 
-        for n, raw in enumerate(fanuc.splitlines(), 1):
-            content.extend(self._process_line(raw, n))
+    def emit_m25(self):
+        if self.last_block != 'M25':
+            self.emit(['M25'])
+        self.pos['Z'] = None
+        self.last_motion_out = None
 
-        # Trim trailing blanks; guarantee file ends with E
-        while content and not content[-1].strip():
-            content.pop()
-        if not content or content[-1].strip() != 'E':
-            content.append('E')
-
-        # Build final output: % header → N-numbered lines → E
-        out = ['%']
-        n_num = 2
-        for line in content:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped == 'E':
-                out.append('E')
+    def motion_word(self, code, words):
+        """Add the motion G code if it changed. Keeps one G code per block."""
+        if self.last_motion_out != code:
+            if any(w.startswith('G') for w in words):
+                self.emit([f"G{code:02d}"])
             else:
-                out.append(f'N{n_num}{line}')
-                n_num += 2
+                words.insert(0, f"G{code:02d}")
+            self.last_motion_out = code
 
-        return '\n'.join(out)
+    def feed_word(self, words):
+        if self.feed is not None and self.feed != self.last_feed_out:
+            words.append('F' + fnum(self.feed, FEED_DEC))
+            self.last_feed_out = self.feed
 
-    # ── Per-line processing (returns 0-N output lines) ───────────────────────
-    def _process_line(self, raw: str, n: int) -> List[str]:
+    # ----------------------------------------------------------------- input
+    def process(self, lineno, raw):
+        self.lineno = lineno
+        s = strip_comments(raw.strip().upper()).strip()
+        if not s or s == '%' or self.ended:
+            return
+        if s.startswith('/'):
+            self.warn("block-delete '/' ignored; block was kept")
+            s = s[1:]
+        if s.startswith('O') or s.startswith(':'):
+            return
+        leftover = WORD.sub('', s).strip()
+        if leftover:
+            self.warn(f"unreadable text dropped: {leftover!r}")
+        raw_words = WORD.findall(s)
+        self.raw = {L: v for L, v in raw_words}
+        words = [(L, float(v)) for L, v in raw_words if L != 'N']
+        gs = [round(v, 1) for L, v in words if L == 'G']
+        ms = [int(v) for L, v in words if L == 'M']
+        vals = {L: v for L, v in words if L not in 'GMN'}
 
-        # ── 1. Drop bare program delimiters and O-number headers ─────────
-        stripped_raw = raw.strip()
-        if stripped_raw in ('%', '%%'):
-            return []
-        # O-number lines (Fanuc program ID): O1234, O(NAME)
-        if re.match(r'^O[\d(]', stripped_raw, re.IGNORECASE):
-            return []
+        if 10 in gs or 65 in gs:
+            self.warn("G10/G65 block dropped")
+            return
 
-        # ── 2. Strip input N-number; remove comments ──────────────────────
-        line = _strip_n(stripped_raw)
-        line = re.sub(r'\([^)]*\)', '', line)   # (parenthesis comments)
-        line = re.sub(r';.*$', '', line).strip()
-        if not line:
-            return []
+        # ---- home / machine-coordinate retracts ----
+        if any(g in gs for g in (28, 30, 53)):
+            if 'Z' in vals or not ('X' in vals or 'Y' in vals):
+                self.emit_m25()
+            if 'X' in vals or 'Y' in vals:
+                self.warn("XY home/machine move dropped (no Hurco equivalent)")
+            self.do_m_codes(ms, vals, before=True)
+            self.do_m_codes(ms, vals, before=False)
+            return
 
-        # ── 3. G28 Z0  →  M25 ────────────────────────────────────────────
-        if re.match(r'G28\s*Z0\.?0*\s*$', line, re.IGNORECASE):
-            self.info.append(f'L{n}: G28 Z0 → M25')
-            self._modal_cycle = None
-            return ['M25']
+        new_motion = None
+        cycle_code = None
+        comp = None
+        solo = []
+        for g in gs:
+            gi = int(g) if g == int(g) else g
+            if gi in (0, 1, 2, 3):
+                new_motion = gi
+            elif gi == 17:
+                if self.plane != 17:
+                    self.plane = 17
+                solo.append('G17')
+            elif gi in (18, 19):
+                self.plane = gi
+            elif gi in (20, 21):
+                if (gi == 21) != self.metric:
+                    self.metric = gi == 21
+                    solo.append('G71' if self.metric else 'G70')
+            elif gi == 90:
+                self.absolute = True
+            elif gi == 91:
+                self.absolute = False
+                self.warn("G91 incremental moves converted to absolute")
+            elif gi == 90.1:
+                self.ij_absolute_in = True
+            elif gi == 91.1:
+                self.ij_absolute_in = False
+            elif gi in (40, 41, 42):
+                comp = f"G{gi}"
+            elif gi == 4:
+                sec = self.dwell_seconds(vals)
+                if sec is not None:
+                    self.emit(['G04', 'P' + fnum(sec, 3)])
+                return
+            elif gi in (9, 61, 64, 75):
+                solo.append(f"G{gi:02d}")
+            elif gi == 80:
+                self.cancel_cycle()
+            elif gi in CYCLE_TEMPLATES:
+                cycle_code = gi
+            elif gi in CYCLE_MAP:
+                self.warn(f"G{gi} not supported; mapped to G{CYCLE_MAP[gi]} - verify")
+                cycle_code = CYCLE_MAP[gi]
+            elif gi == 98:
+                self.cycle_return = 'init'
+            elif gi == 99:
+                self.cycle_return = 'R'
+            elif gi in (94,):
+                pass
+            elif gi == 95:
+                self.warn("G95 feed-per-rev found: F values will be WRONG on the Hurco")
+            else:
+                self.warn(f"G{gi} not supported; removed")
 
-        # ── 4. G80 clears modal canned cycle ─────────────────────────────
-        if re.search(r'(?<![A-Za-z\d])G80(?!\d)', line, re.IGNORECASE):
-            self._modal_cycle = None
-            # G80 still gets emitted as a normal line below
+        for w in solo:
+            if self.last_block != w:
+                self.emit([w])
+        if 'H' in vals:
+            vals.pop('H')
+        dword = None
+        if 'D' in vals:
+            d = vals.pop('D')
+            if KEEP_D_WORD and comp in ('G41', 'G42'):
+                dword = f"D{int(d)}"
+            elif not KEEP_D_WORD:
+                self.warn("D (comp offset) word removed")
+        if dword:
+            comp = comp + '|' + dword
+        if 'F' in vals:
+            self.feed = vals.pop('F')
 
-        # ── 5. Unit-mode swaps ────────────────────────────────────────────
-        line = re.sub(r'(?<![A-Za-z\d])G20(?!\d)', 'G70', line, flags=re.IGNORECASE)
-        line = re.sub(r'(?<![A-Za-z\d])G21(?!\d)', 'G71', line, flags=re.IGNORECASE)
+        self.do_m_codes(ms, vals, before=True)
 
-        # ── 6. Strip work offsets, tool-length comp, H-words ─────────────
-        for code in STRIP_G:
-            if re.search(rf'(?<![A-Za-z\d]){code}(?!\d)', line, re.IGNORECASE):
-                line = re.sub(rf'(?<![A-Za-z\d]){code}(?!\d)', '',
-                              line, flags=re.IGNORECASE)
-                self.info.append(f'L{n}: stripped {code}')
+        axes = any(a in vals for a in 'XYZ')
+        arcw = any(a in vals for a in 'IJKR')
+        if cycle_code is not None:
+            self.do_cycle(cycle_code, vals, new_line=True)
+        elif self.cycle and new_motion is None and (axes or 'R' in vals or 'Q' in vals):
+            self.do_cycle(self.cycle['code'], vals, new_line=False)
+        else:
+            if new_motion is not None:
+                if self.cycle:
+                    self.cancel_cycle()
+                self.motion = new_motion
+            if axes or (self.motion in (2, 3) and arcw):
+                if self.motion in (2, 3):
+                    self.do_arc(vals, comp)
+                else:
+                    self.do_linear(vals, comp)
+                comp = None
+            if comp:
+                self.emit([w for w in comp.split('|') if w])
 
-        if re.search(r'(?<![A-Za-z])H\d+', line, re.IGNORECASE):
-            line = re.sub(r'(?<![A-Za-z])H\d+', '', line, flags=re.IGNORECASE)
-            self.info.append(f'L{n}: stripped H-word')
+        self.do_m_codes(ms, vals, before=False)
 
-        line = line.strip()
-        if not line:
-            return []
+    # ------------------------------------------------------------- M, S, T
+    def do_m_codes(self, ms, vals, before):
+        if before:
+            if 6 in ms:
+                if 'T' not in vals:
+                    self.warn("M06 without T word")
+                t = int(vals.get('T', 0))
+                if t > MAX_TOOL:
+                    self.warn(f"tool T{t} is above the BX limit of {MAX_TOOL}")
+                self.emit_m25()
+                self.emit([f"T{t}", "M06"])
+                self.emit_m25()
+            elif 'T' in vals:
+                self.warn("tool pre-select (T without M06) dropped")
+            spin = [m for m in ms if m in (3, 4)]
+            if 'S' in vals or spin:
+                w = []
+                if 'S' in vals:
+                    rpm = int(round(vals['S']))
+                    if rpm and not (RPM_RANGE[0] <= rpm <= RPM_RANGE[1]):
+                        self.warn(f"S{rpm} outside BX spindle range {RPM_RANGE[0]}-{RPM_RANGE[1]}")
+                    w.append(f"S{rpm}")
+                if spin:
+                    w.append(f"M{spin[0]:02d}")
+                    self.spindle_on = True
+                self.emit(w)
+            for m in ms:
+                if m in (7, 8):
+                    self.emit([f"M{m:02d}"])
+                    self.coolant_on = True
+            return
+        for m in ms:
+            if m in (3, 4, 6, 7, 8):
+                continue
+            if m in (30, 2):
+                self.finish()
+                return
+            if m == 5:
+                self.emit(['M05']); self.spindle_on = False
+            elif m == 9:
+                self.emit(['M09']); self.coolant_on = False
+            elif m == 25:
+                self.emit_m25()
+            elif m in ALLOWED_M:
+                self.emit([f"M{m:02d}"])
+            else:
+                self.warn(f"M{m} not supported; removed")
 
-        # ── 7. Modal canned-cycle continuation ────────────────────────────
-        # A position-only line (no G-code) while a canned cycle is modal.
-        # The Hurco carries Z/F forward modally, so only the new XY position
-        # is needed.  The backplot parser's modal_cycle tracker draws the plunge.
-        if (not _has_g(line)
-                and self._modal_cycle is not None
-                and (_word(line, 'X') is not None or _word(line, 'Y') is not None)):
-            return [self._enforce_decimals(line)]
+    def finish(self):
+        if self.cycle:
+            self.cancel_cycle()
+        self.emit_m25()
+        self.emit(['G00'])
+        self.last_motion_out = 0
+        if self.coolant_on:
+            self.emit(['M09']); self.coolant_on = False
+        self.emit_m25()
+        if self.spindle_on:
+            self.emit(['M05']); self.spindle_on = False
+        self.emit(['M02'])
+        self.ended = True
 
-        # ── 8. Canned-cycle 3-Z rewrite ───────────────────────────────────
-        converted = self._convert_canned(line, n)
-        if converted is not None:
-            return [converted]  # canned-cycle output is always valid vocabulary
+    # --------------------------------------------------------------- motion
+    def target(self, vals):
+        t = dict(self.pos)
+        for a in 'XYZ':
+            if a in vals:
+                if self.absolute:
+                    t[a] = vals[a]
+                else:
+                    if self.pos[a] is None:
+                        self.warn("incremental move from unknown Z (after M25) - check")
+                        t[a] = vals[a]
+                    else:
+                        t[a] = self.pos[a] + vals[a]
+        return t
 
-        # ── 9. Decimal enforcement ────────────────────────────────────────
-        line = self._enforce_decimals(line)
+    def do_linear(self, vals, comp):
+        t = self.target(vals)
+        words = []
+        dword = None
+        if comp:
+            comp, _, dword = comp.partition('|')
+            words.append(comp)
+        for a in 'XYZ':
+            if a in vals:
+                words.append(a + fnum(t[a]))
+        if dword:
+            words.append(dword)
+        self.motion_word(self.motion, words)
+        if self.motion == 1:
+            self.feed_word(words)
+        self.emit(words)
+        self.pos = t
 
-        # ── 10. Split multi-G-code lines → one G per line ─────────────────
-        segments = self._split_gcodes(line)
+    def do_arc(self, vals, comp):
+        cw = self.motion == 2
+        t = self.target(vals)
+        # plane mapping: (u, v) arc axes, w linear axis, offset letters
+        u, v, w, iu, iv = {17: ('X', 'Y', 'Z', 'I', 'J'),
+                           18: ('Z', 'X', 'Y', 'K', 'I'),
+                           19: ('Y', 'Z', 'X', 'J', 'K')}[self.plane]
+        if self.pos[u] is None or self.pos[v] is None:
+            self.warn("arc started from unknown position (after M25); skipped")
+            return
+        su, sv = self.pos[u], self.pos[v]
+        eu, ev = t[u], t[v]
+        if 'R' in vals:
+            c = self.center_from_r(su, sv, eu, ev, vals['R'], cw)
+            if c is None:
+                return
+            cu, cv = c
+        elif iu in vals or iv in vals:
+            ou, ov = vals.get(iu, 0.0), vals.get(iv, 0.0)
+            if self.ij_absolute_in:
+                cu, cv = ou, ov
+            else:
+                cu, cv = su + ou, sv + ov
+        else:
+            self.warn("arc with no I/J/R treated as a straight move")
+            self.do_linear(vals, comp)
+            return
+        r0 = math.hypot(su - cu, sv - cv)
+        r1 = math.hypot(eu - cu, ev - cv)
+        if abs(r0 - r1) > 0.001:
+            self.warn(f"arc radius mismatch {abs(r0-r1):.4f} in source")
+        a0 = math.atan2(sv - cv, su - cu)
+        a1 = math.atan2(ev - cv, eu - cu)
+        sweep = (a0 - a1) if cw else (a1 - a0)
+        sweep %= 2 * math.pi
+        if sweep < 1e-9:
+            sweep = 2 * math.pi
+        sw0 = self.pos[w]
+        sw1 = t[w]
+        helical = sw0 is not None and sw1 is not None and abs(sw1 - sw0) > EPS
+        sign = -1 if cw else 1
 
-        # ── 11. Sanitize: strip any G/M codes not in the allowed vocabulary ─
-        sanitized = [self._sanitize(s, n) for s in segments]
+        if self.plane != 17:
+            if sw0 is None and helical:
+                self.warn("helix in G18/G19 from unknown position; skipped")
+                return
+            step = 2 * math.acos(max(-1.0, 1 - LINEARIZE_TOL / max(r0, 1e-9)))
+            nseg = max(1, math.ceil(sweep / max(step, 1e-3)))
+            self.warn(f"G{self.plane} arc converted to straight moves")
+            for k in range(1, nseg + 1):
+                p = dict(self.pos)
+                if k == nseg:
+                    p = dict(t)
+                else:
+                    ang = a0 + sign * sweep * k / nseg
+                    p[u] = cu + r0 * math.cos(ang)
+                    p[v] = cv + r0 * math.sin(ang)
+                    if helical:
+                        p[w] = sw0 + (sw1 - sw0) * k / nseg
+                words = [a + fnum(p[a]) for a in 'XYZ' if p[a] is not None]
+                self.motion_word(1, words)
+                self.feed_word(words)
+                self.emit(words)
+                self.pos = p
+            return
 
-        return [s for s in sanitized if s.strip()]
+        limit = self.helix_max if helical else ARC_MAX_DEG
+        nseg = max(1, math.ceil(math.degrees(sweep) / limit - 1e-9))
+        kword = None
+        if helical and HELIX_K:
+            pitch = (sw1 - sw0) * 2 * math.pi / sweep
+            if HELIX_K == 'unsigned':
+                pitch = abs(pitch)
+            kword = 'K' + fnum(pitch)
+        for k in range(1, nseg + 1):
+            if k == nseg:
+                px, py, pz = eu, ev, sw1
+            else:
+                ang = a0 + sign * sweep * k / nseg
+                px = cu + r0 * math.cos(ang)
+                py = cv + r0 * math.sin(ang)
+                pz = sw0 + (sw1 - sw0) * k / nseg if helical else sw1
+            words = []
+            if comp and k == 1:
+                self.warn("cutter comp change on an arc; comp code put on its own block")
+                self.emit([comp.split('|')[0]])
+            words += ['X' + fnum(px), 'Y' + fnum(py)]
+            if helical or ('Z' in vals and pz is not None):
+                words.append('Z' + fnum(pz))
+            words += ['I' + fnum(cu), 'J' + fnum(cv)]
+            if kword:
+                words.append(kword)
+            self.motion_word(self.motion, words)
+            self.feed_word(words)
+            self.emit(words)
+            self.pos = {'X': px, 'Y': py, 'Z': pz}
 
-    # ── Canned-cycle rewrite ─────────────────────────────────────────────────
-    def _convert_canned(self, line: str, n: int) -> Optional[str]:
-        """
-        Rewrite a Fanuc canned-cycle line to Hurco 3-Z format and save modal state.
-        Returns None if the line is not a canned cycle.
+    def center_from_r(self, sx, sy, ex, ey, r, cw):
+        dx, dy = ex - sx, ey - sy
+        d = math.hypot(dx, dy)
+        if d < EPS:
+            self.warn("R-format full circle is impossible; block skipped")
+            return None
+        h2 = r * r - (d / 2) ** 2
+        if h2 < -1e-6:
+            self.warn("R too small for arc endpoints; block skipped")
+            return None
+        h = math.sqrt(max(h2, 0.0))
+        nx, ny = -dy / d, dx / d          # left-hand normal of the chord
+        side = 1 if not cw else -1        # small CCW arc: center on the left
+        if r < 0:
+            side = -side
+        mx, my = (sx + ex) / 2, (sy + ey) / 2
+        return mx + side * h * nx, my + side * h * ny
 
-        Fanuc:  G83 X Y Z[depth]  R[start]  Q[peck]  F
-        Hurco:  G83 X Y Z[start]  Z[depth]  Z[peck]  F
-        """
-        f_val = _word(line, 'F')
-        fstr  = f' F{_fmt(f_val)}' if f_val is not None else ''
-        xy    = self._xy_str(line)
+    def dwell_seconds(self, vals):
+        """Fanuc: X = seconds, P = milliseconds unless written with a decimal."""
+        if 'X' in vals:
+            return vals['X']
+        if 'P' in vals:
+            raw = self.raw.get('P', '')
+            return vals['P'] if '.' in raw else vals['P'] / 1000.0
+        self.warn("dwell with no time dropped")
+        return None
 
-        def _g(code: str) -> bool:
-            return bool(re.search(
-                rf'(?<![A-Za-z\d]){code}(?!\d)', line, re.IGNORECASE))
+    # --------------------------------------------------------------- cycles
+    def rapid_z(self, z):
+        if self.pos['Z'] is None or abs(self.pos['Z'] - z) > EPS:
+            w = ['Z' + fnum(z)]
+            self.motion_word(0, w)
+            self.emit(w)
+            self.pos['Z'] = z
 
-        # G83 — peck drill
-        if _g('G83'):
-            z, r, q = _word(line,'Z'), _word(line,'R'), _word(line,'Q')
-            if None in (z, r, q):
-                self.errors.append(f'L{n}: G83 missing Z/R/Q')
-                return self._enforce_decimals(line)
-            self._modal_cycle = {'code':'G83','r':r,'depth':z,'q':q,'f':f_val}
-            result = f'G83{xy} Z{_fmt(r)} Z{_fmt(z)} Z{_fmt(q)}{fstr}'
-            self.info.append(f'L{n}: G83 3-Z → Z{_fmt(r)} / Z{_fmt(z)} / Z{_fmt(q)}')
-            return result
+    def feed_z(self, z):
+        w = ['Z' + fnum(z)]
+        self.motion_word(1, w)
+        self.feed_word(w)
+        self.emit(w)
+        self.pos['Z'] = z
 
-        # G81 — drill, no dwell
-        if _g('G81'):
-            z, r = _word(line,'Z'), _word(line,'R')
-            if None in (z, r):
-                self.errors.append(f'L{n}: G81 missing Z/R')
-                return self._enforce_decimals(line)
-            self._modal_cycle = {'code':'G81','r':r,'depth':z,'f':f_val}
-            result = f'G81{xy} Z{_fmt(r)} Z{_fmt(z)}{fstr}'
-            self.info.append(f'L{n}: G81 3-Z → Z{_fmt(r)} / Z{_fmt(z)}')
-            return result
+    def expand_cycle(self, c, moved=True):
+        code, r, depth = c['code'], c['R'], c['Z']
+        if r is None or depth is None:
+            self.warn(f"G{code} missing R or Z; hole skipped")
+            return
+        ret = c['init_z'] if (self.cycle_return == 'init' and c['init_z'] is not None) else r
+        if moved:
+            w = ['X' + fnum(self.pos['X']), 'Y' + fnum(self.pos['Y'])]
+            self.motion_word(0, w)
+            self.emit(w)
+        self.rapid_z(r)
+        if code == 83:
+            q = c['Q'] or abs(r - depth)
+            if not c['Q']:
+                self.warn("G83 without Q: drilled in one peck")
+            cur = r
+            while cur > depth + EPS:
+                nxt = max(depth, cur - q)
+                if cur < r - EPS:
+                    self.rapid_z(min(r, cur + PECK_CLEARANCE))
+                self.feed_z(nxt)
+                cur = nxt
+                if cur > depth + EPS:
+                    self.rapid_z(r)
+        else:
+            self.feed_z(depth)
+            if code == 82 and c.get('P'):
+                self.emit(['G04', 'P' + fnum(c['P'], 3)])
+                self.last_motion_out = None
+            if code == 85:
+                self.feed_z(r)
+        self.rapid_z(ret)
 
-        # G82 — drill with dwell
-        if _g('G82'):
-            z, r = _word(line,'Z'), _word(line,'R')
-            if None in (z, r):
-                self.errors.append(f'L{n}: G82 missing Z/R')
-                return self._enforce_decimals(line)
-            p = _word(line,'P')
-            self._modal_cycle = {'code':'G82','r':r,'depth':z,'p':p,'f':f_val}
-            pstr = f' P{_fmt(p)}' if p is not None else ''
-            result = f'G82{xy} Z{_fmt(r)} Z{_fmt(z)}{pstr}{fstr}'
-            self.info.append(f'L{n}: G82 3-Z → Z{_fmt(r)} / Z{_fmt(z)}')
-            return result
+    def cancel_cycle(self):
+        if not self.cycle:
+            return
+        if self.cycle.get('native'):
+            self.emit(['G80'])
+        c = self.cycle
+        self.pos['Z'] = c['init_z'] if self.cycle_return == 'init' else c['R']
+        self.cycle = None
+        self.last_motion_out = None
 
-        # G84 — tapping
-        if _g('G84'):
-            z, r = _word(line,'Z'), _word(line,'R')
-            if None in (z, r):
-                self.errors.append(f'L{n}: G84 missing Z/R')
-                return self._enforce_decimals(line)
-            self._modal_cycle = {'code':'G84','r':r,'depth':z,'f':f_val}
-            result = f'G84{xy} Z{_fmt(r)} Z{_fmt(z)}{fstr}'
-            self.info.append(f'L{n}: G84 3-Z → Z{_fmt(r)} / Z{_fmt(z)}')
-            return result
+    def do_cycle(self, code, vals, new_line):
+        if self.cycle is None:
+            self.cycle = {'code': code, 'init_z': self.pos['Z'],
+                          'R': None, 'Z': None, 'Q': None, 'P': None, 'sent': None}
+        c = self.cycle
+        c['code'] = code
+        if 'R' in vals:
+            if self.absolute:
+                c['R'] = vals['R']
+            else:
+                c['R'] = (c['init_z'] or 0.0) + vals['R']
+        if 'Z' in vals:
+            c['Z'] = vals['Z'] if self.absolute else (c['R'] or 0.0) + vals['Z']
+        if 'Q' in vals:
+            c['Q'] = abs(vals['Q'])
+        if 'P' in vals:
+            c['P'] = self.dwell_seconds(vals)
+        native = CYCLE_MODE != 'expand' or code == 84
+        c['native'] = native
+        if not native:
+            moved = False
+            for a in 'XY':
+                if a in vals:
+                    new = vals[a] if self.absolute else self.pos[a] + vals[a]
+                    moved |= self.pos[a] is None or abs(new - self.pos[a]) > EPS
+                    self.pos[a] = new
+            self.expand_cycle(c, moved)
+            return
+        if code == 84:
+            self.warn("G84 tapping sent as a native cycle - verify format on the machine")
+        if c.get('P'):
+            self.warn(f"G{code} dwell dropped in native mode - Hurco cycle dwell word unknown")
+        for a in 'XY':
+            if a in vals:
+                self.pos[a] = vals[a] if self.absolute else self.pos[a] + vals[a]
 
-        # G85 — boring
-        if _g('G85'):
-            z, r = _word(line,'Z'), _word(line,'R')
-            if None in (z, r):
-                self.errors.append(f'L{n}: G85 missing Z/R')
-                return self._enforce_decimals(line)
-            self._modal_cycle = {'code':'G85','r':r,'depth':z,'f':f_val}
-            result = f'G85{xy} Z{_fmt(r)} Z{_fmt(z)}{fstr}'
-            self.info.append(f'L{n}: G85 3-Z → Z{_fmt(r)} / Z{_fmt(z)}')
-            return result
+        tmpl = CYCLE_TEMPLATES[code]
+        params = (code, c['R'], c['Z'], c['Q'], self.feed)
+        words = ['X' + fnum(self.pos['X']), 'Y' + fnum(self.pos['Y'])]
+        if params != c['sent']:
+            words.insert(0, f"G{code}")
+            for key in tmpl:
+                val = c[key]
+                if key == 'Q':
+                    if val is None:
+                        val = abs((c['R'] or 0) - (c['Z'] or 0))
+                        self.warn(f"G{code} without Q: peck set to full depth")
+                    val *= PECK_SIGN
+                if val is None:
+                    self.warn(f"G{code} missing {key} value")
+                    continue
+                words.append('Z' + fnum(val))
+            if self.feed is not None:
+                words.append('F' + fnum(self.feed, FEED_DEC))
+                self.last_feed_out = self.feed
+            c['sent'] = params
+        self.emit(words)
+        self.last_motion_out = None
+        self.pos['Z'] = c['init_z'] if self.cycle_return == 'init' else c['R']
 
-        return None  # not a canned cycle
+    # --------------------------------------------------------------- result
+    def result(self):
+        if not self.ended:
+            self.lineno = 0
+            self.warn("no M30/M02 in source; end sequence added")
+            self.finish()
+        return '\n'.join(['%'] + self.body + ['E']) + '\n'
 
-    # ── Static helpers ────────────────────────────────────────────────────────
-    @staticmethod
-    def _enforce_decimals(line: str) -> str:
-        """Append .0 to bare-integer X/Y/Z values (e.g. X5 → X5.0)."""
-        return re.sub(
-            r'(?<![A-Za-z])([XYZ])([+-]?\d+)(?![\d.])',
-            lambda m: f'{m.group(1)}{m.group(2)}.0',
-            line,
-            flags=re.IGNORECASE,
-        )
 
-    @staticmethod
-    def _xy_str(line: str) -> str:
-        """Extract X and Y words, formatting values with _fmt for decimal safety."""
-        parts: List[str] = []
-        for letter in ('X', 'Y'):
-            m = re.search(rf'(?<![A-Za-z]){letter}([+-]?\d*\.?\d+)',
-                          line, re.IGNORECASE)
-            if m:
-                parts.append(f'{letter}{_fmt(float(m.group(1)))}')
-        return (' ' + ' '.join(parts)) if parts else ''
+def convert(text, helix_max=HELIX_MAX_DEG):
+    """Fanuc text -> (hurco text, warnings OrderedDict{message: [source lines]})."""
+    metric = bool(re.search(r'\bG21\b', strip_comments(text.upper())))
+    conv = Converter(helix_max=helix_max, metric=metric)
+    for i, line in enumerate(text.splitlines(), 1):
+        conv.process(i, line)
+    return conv.result(), conv.warnings
 
-    @staticmethod
-    def _split_gcodes(line: str) -> List[str]:
-        """
-        If *line* contains more than one G-code, split it so each output line
-        has exactly one G-code.  Non-G parameters (X,Y,Z,F,S,T,I,J,R,Q,P,M)
-        stay with the G-code they immediately follow.
-        """
-        g_count = len(re.findall(r'(?<![A-Za-z\d])G\d+', line, re.IGNORECASE))
-        if g_count <= 1:
-            return [line.strip()] if line.strip() else []
 
-        # Split at every G-code boundary using a zero-width lookahead
-        parts = re.split(r'(?=(?<![A-Za-z\d])G\d)', line, flags=re.IGNORECASE)
-        return [p.strip() for p in parts if p.strip()]
-
-    def _sanitize(self, line: str, n: int) -> str:
-        """
-        Remove any G/M codes not in the allowed Hurco vocabulary and log them.
-        Returns the cleaned line (may be empty if the whole line was invalid).
-        """
-        def drop_g(m: re.Match) -> str:
-            code = f'G{int(m.group(1)):02d}'
-            if code not in VALID_G:
-                self.errors.append(f'L{n}: removed unsupported {code}')
-                return ''
-            return m.group(0)
-
-        def drop_m(m: re.Match) -> str:
-            code = f'M{int(m.group(1)):02d}'
-            if code not in VALID_M:
-                self.errors.append(f'L{n}: removed unsupported {code}')
-                return ''
-            return m.group(0)
-
-        line = re.sub(r'(?<![A-Za-z\d])G(\d+)', drop_g, line, flags=re.IGNORECASE)
-        line = re.sub(r'(?<![A-Za-z\d])M(\d+)', drop_m, line, flags=re.IGNORECASE)
-        return ' '.join(line.split())  # collapse any leftover whitespace
+# ─────────────────────────────────────────────────────────────────────────────
+# Independent output checker
+# ─────────────────────────────────────────────────────────────────────────────
+def check(text):
+    """Independent check of a Hurco-format file. Returns (problems, stats)."""
+    probs = []
+    pos = {'X': None, 'Y': None, 'Z': None}
+    motion = None
+    worst = 0.0
+    arcs = 0
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != '%':
+        probs.append("first line is not %")
+    if not lines or lines[-1].strip() != 'E':
+        probs.append("last line is not E")
+    expect = N_START
+    arc_zdir = 0          # Z direction within the current run of arc blocks
+    for ln in lines[1:-1]:
+        if not ln.strip():
+            continue
+        m = re.fullmatch(r'N(\d+)((?:[A-Z][-]?\d*\.?\d*)+)', ln.strip())
+        if not m:
+            probs.append(f"bad block: {ln}")
+            continue
+        if int(m.group(1)) != expect:
+            probs.append(f"N sequence break at {ln}")
+        expect = int(m.group(1)) + N_STEP
+        w = [(L, float(v))
+             for L, v in re.findall(r'([A-Z])(-?\d*\.?\d*)', m.group(2))
+             if re.fullmatch(r'-?(?:\d+\.?\d*|\.\d+)', v)]
+        gs = [int(v) for L, v in w if L == 'G']
+        if re.search(r'G9[01]\.', ln):
+            probs.append(f"G90.x/G91.x code (control may read it as G91): {ln}")
+        if len(gs) > 1:
+            probs.append(f"more than one G code: {ln}")
+        for g in gs:
+            if g not in ALLOWED_G:
+                probs.append(f"unsupported G{g}: {ln}")
+        for L, v in w:
+            if L == 'M' and int(v) not in ALLOWED_M:
+                probs.append(f"unsupported M{int(v)}: {ln}")
+            if L not in 'NGMXYZIJKFSTPD':
+                probs.append(f"unexpected word {L}: {ln}")
+        vals = dict((L, v) for L, v in w if L not in 'GM')
+        for g in gs:
+            if g in (0, 1, 2, 3):
+                motion = g
+            if g in range(81, 86):
+                motion = 'cycle'
+            if g == 80:
+                motion = None
+        if any(v == 25 for L, v in w if L == 'M'):
+            pos['Z'] = None
+        if motion in (2, 3) and 'Z' in vals and pos['Z'] is not None:
+            dz = vals['Z'] - pos['Z']
+            if abs(dz) > 1e-9:
+                d = 1 if dz > 0 else -1
+                if arc_zdir and d != arc_zdir:
+                    probs.append(f"Z reverses direction inside a helix: {ln}")
+                arc_zdir = d
+        elif motion not in (2, 3):
+            arc_zdir = 0
+        if motion in (2, 3) and ('I' in vals or 'J' in vals or 'X' in vals):
+            arcs += 1
+            miss = [a for a in 'XYIJ' if a not in vals]
+            if miss:
+                probs.append(f"arc missing {''.join(miss)}: {ln}")
+                continue
+            if pos['X'] is None:
+                probs.append(f"arc from unknown position: {ln}")
+            else:
+                r0 = math.hypot(pos['X'] - vals['I'], pos['Y'] - vals['J'])
+                r1 = math.hypot(vals['X'] - vals['I'], vals['Y'] - vals['J'])
+                worst = max(worst, abs(r0 - r1))
+                if abs(r0 - r1) > 0.0005:
+                    probs.append(f"arc radius error {abs(r0-r1):.4f}: {ln}")
+                dz = (vals['Z'] - pos['Z']) if ('Z' in vals and pos['Z'] is not None) else 0.0
+                if abs(dz) > 1e-9 and HELIX_K:
+                    if 'K' not in vals:
+                        probs.append(f"helical arc without K: {ln}")
+                    else:
+                        a0 = math.atan2(pos['Y'] - vals['J'], pos['X'] - vals['I'])
+                        a1 = math.atan2(vals['Y'] - vals['J'], vals['X'] - vals['I'])
+                        sw = ((a0 - a1) if motion == 2 else (a1 - a0)) % (2 * math.pi) or 2 * math.pi
+                        k = vals['K']
+                        if HELIX_K == 'unsigned':
+                            k = math.copysign(k, dz)
+                        expect_dz = k * sw / (2 * math.pi)
+                        if abs(expect_dz - dz) > 0.0005:
+                            probs.append(f"K pitch disagrees with Z travel "
+                                         f"({expect_dz:.4f} vs {dz:.4f}): {ln}")
+        for a in 'XYZ':
+            if a in vals and not (motion == 'cycle' and a == 'Z'):
+                pos[a] = vals[a]
+    return probs, {'arcs': arcs, 'worst_radius_error': round(worst, 5),
+                   'characters': len(text), 'blocks': max(len(lines) - 2, 0)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -378,13 +792,22 @@ class FanucConverter:
 # ─────────────────────────────────────────────────────────────────────────────
 Segment = Tuple[float, float, float, float, float, float]  # x0 y0 z0 x1 y1 z1
 
+ARC_PLOT_DEG = 4.0   # chord resolution when drawing G02/G03 blocks
+
 
 class BackplotParser:
     """
-    Parses converted Hurco BNC output (with N-numbers) and builds segment lists:
-      rapid  — G00        red dashed
-      feed   — G01/02/03  blue solid
-      plunge — G81-G85    green solid (vertical plunge to depth)
+    Parses converted Hurco BNC output and builds segment lists:
+      rapid  — G00                    red dashed
+      feed   — G01 / G02 / G03        blue solid
+      plunge — drilling Z-down moves  green solid
+
+    Reads the same format the Converter writes: one G code per block, N-numbers
+    glued to the content, absolute coordinates, absolute I/J arc centers.
+
+    M25 has no coordinate in the output, so the Z it retracts to is inferred as
+    the highest Z the program ever commands (pre-scanned) — enough to keep the
+    plotted path connected and correctly ordered.
     """
 
     def __init__(self) -> None:
@@ -392,110 +815,145 @@ class BackplotParser:
         self.feed:   List[Segment] = []
         self.plunge: List[Segment] = []
 
+    # ── Public ───────────────────────────────────────────────────────────────
     def parse(self, bnc: str) -> None:
         self.rapid, self.feed, self.plunge = [], [], []
 
-        x = y = z = 0.0
-        modal_motion = 'G00'
-        modal_cycle: Optional[Dict] = None   # mirrors converter's _modal_cycle
+        z_home = self._scan_z_home(bnc)
+        x = y = 0.0
+        z = z_home
+        motion = 0
+        cycle: Optional[Dict] = None   # native G8x state: {'code', 'r', 'depth'}
 
         for raw in bnc.splitlines():
-            # Strip leading N-number prefix (e.g. "N10G01..." → "G01...")
-            line = re.sub(r'^N\d+', '', raw.strip())
-            line = line.strip()
-
-            if not line or line == 'E' or line == '%':
+            block = raw.strip()
+            if not block or block in ('%', 'E'):
                 continue
 
-            # ── Update linear/arc modal ──────────────────────────────────
-            for pat, code in (
-                (r'(?<![A-Za-z\d])G00(?!\d)', 'G00'),
-                (r'(?<![A-Za-z\d])G01(?!\d)', 'G01'),
-                (r'(?<![A-Za-z\d])G02(?!\d)', 'G02'),
-                (r'(?<![A-Za-z\d])G03(?!\d)', 'G03'),
-            ):
-                if re.search(pat, line, re.IGNORECASE):
-                    modal_motion = code
-                    break
+            words = self._words(block)
+            if words is None:
+                continue
+            gs, ms, vals, zs = words
 
-            # ── G80 cancels canned cycle ─────────────────────────────────
-            if re.search(r'(?<![A-Za-z\d])G80(?!\d)', line, re.IGNORECASE):
-                modal_cycle = None
-
-            # ── Canned cycles (3-Z BNC format) ───────────────────────────
-            cm = re.search(r'(?<![A-Za-z\d])G8([1-5])(?!\d)', line, re.IGNORECASE)
-            if cm:
-                nx = _word(line, 'X')
-                ny = _word(line, 'Y')
-                zs = _all_z(line)   # [Z_start(R-plane), Z_depth, Z_peck?]
-
-                nx = nx if nx is not None else x
-                ny = ny if ny is not None else y
-
-                # Store for any subsequent modal continuation lines
-                if len(zs) >= 2:
-                    modal_cycle = {'r': zs[0], 'depth': zs[1]}
-
-                # Rapid move to XY position
-                if (nx, ny) != (x, y):
-                    self.rapid.append((x, y, z, nx, ny, z))
-
-                if len(zs) >= 2:
-                    z_r = zs[0]  # R-plane
-                    z_d = zs[1]  # final depth
-                    self.rapid.append((nx, ny, z,   nx, ny, z_r))  # to R-plane
-                    self.plunge.append((nx, ny, z_r, nx, ny, z_d)) # plunge
-                    self.rapid.append((nx, ny, z_d, nx, ny, z_r))  # retract
-                    z = z_r
-                elif len(zs) == 1:
-                    self.plunge.append((nx, ny, z, nx, ny, zs[0]))
-                    z = zs[0]
-
-                x, y = nx, ny
+            # ── M25: retract to machine home ─────────────────────────────
+            if 25 in ms:
+                if abs(z - z_home) > EPS:
+                    self.rapid.append((x, y, z, x, y, z_home))
+                z = z_home
+                cycle = None
                 continue
 
-            # ── Modal canned cycle continuation (position-only line) ──────
-            # Handles any lines the converter may have expanded, and provides
-            # a safety net if the user feeds partially-converted code.
-            if (modal_cycle is not None
-                    and not _has_g(line)
-                    and (_word(line, 'X') is not None or _word(line, 'Y') is not None)):
-                nx = _word(line, 'X')
-                ny = _word(line, 'Y')
-                nx = nx if nx is not None else x
-                ny = ny if ny is not None else y
+            if 80 in gs:
+                cycle = None
 
-                if (nx, ny) != (x, y):
-                    self.rapid.append((x, y, z, nx, ny, z))
+            for g in gs:
+                if g in (0, 1, 2, 3):
+                    motion = g
 
-                z_r = modal_cycle['r']
-                z_d = modal_cycle['depth']
-                self.rapid.append((nx, ny, z,   nx, ny, z_r))
-                self.plunge.append((nx, ny, z_r, nx, ny, z_d))
-                self.rapid.append((nx, ny, z_d, nx, ny, z_r))
-                z = z_r
-                x, y = nx, ny
+            # ── Native canned cycle: G8x X Y Z(R) Z(depth) [Z(Q)] ────────
+            cyc = next((g for g in gs if g in CYCLE_TEMPLATES), None)
+            if cyc is not None:
+                tmpl = CYCLE_TEMPLATES[cyc]
+                named = dict(zip(tmpl, zs))
+                cycle = {'code': cyc, 'r': named.get('R'), 'depth': named.get('Z')}
+                x, y, z = self._drill(x, y, z, vals, cycle)
                 continue
 
-            # ── Regular motion ────────────────────────────────────────────
-            nx = _word(line, 'X')
-            ny = _word(line, 'Y')
-            nz = _word(line, 'Z')
-
-            if nx is None and ny is None and nz is None:
+            # ── Modal continuation of a native cycle (XY only, no G) ─────
+            if cycle and not gs and ('X' in vals or 'Y' in vals):
+                x, y, z = self._drill(x, y, z, vals, cycle)
                 continue
 
-            nx = nx if nx is not None else x
-            ny = ny if ny is not None else y
-            nz = nz if nz is not None else z
+            # ── Arcs ─────────────────────────────────────────────────────
+            if motion in (2, 3) and 'I' in vals and 'J' in vals:
+                nx = vals.get('X', x)
+                ny = vals.get('Y', y)
+                nz = vals.get('Z', z)
+                for px, py, pz in self._arc_points(x, y, z, nx, ny, nz,
+                                                   vals['I'], vals['J'],
+                                                   cw=(motion == 2)):
+                    self.feed.append((x, y, z, px, py, pz))
+                    x, y, z = px, py, pz
+                continue
 
+            # ── Straight moves ───────────────────────────────────────────
+            if not any(a in vals for a in 'XYZ'):
+                continue
+            nx = vals.get('X', x)
+            ny = vals.get('Y', y)
+            nz = vals.get('Z', z)
             seg: Segment = (x, y, z, nx, ny, nz)
-            if modal_motion == 'G00':
+            if motion == 0:
                 self.rapid.append(seg)
+            elif self._is_plunge(seg):
+                # CYCLE_MODE='expand' turns drilling into plain G01 Z moves;
+                # colour a pure downward feed as a plunge so holes stay visible.
+                self.plunge.append(seg)
             else:
                 self.feed.append(seg)
-
             x, y, z = nx, ny, nz
+
+    # ── Internal ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _words(block: str):
+        """Block -> (g codes, m codes, {letter: value}, [Z values in order])."""
+        found = WORD.findall(block)
+        if not found:
+            return None
+        gs = [int(round(float(v))) for L, v in found if L == 'G']
+        ms = [int(round(float(v))) for L, v in found if L == 'M']
+        vals = {L: float(v) for L, v in found if L not in 'GMN'}
+        zs = [float(v) for L, v in found if L == 'Z']
+        return gs, ms, vals, zs
+
+    @staticmethod
+    def _scan_z_home(bnc: str) -> float:
+        zs = [float(m.group(1))
+              for m in re.finditer(r'(?<![A-Z])Z([-+]?(?:\d+\.?\d*|\.\d+))', bnc)]
+        return max(zs + [0.0])
+
+    @staticmethod
+    def _is_plunge(seg: Segment) -> bool:
+        x0, y0, z0, x1, y1, z1 = seg
+        return abs(x1 - x0) < EPS and abs(y1 - y0) < EPS and z1 < z0 - EPS
+
+    def _drill(self, x, y, z, vals, cycle):
+        """Draw one hole of a native canned cycle; returns the new position."""
+        nx = vals.get('X', x)
+        ny = vals.get('Y', y)
+        if (nx, ny) != (x, y):
+            self.rapid.append((x, y, z, nx, ny, z))
+        r, depth = cycle.get('r'), cycle.get('depth')
+        if r is None or depth is None:
+            return nx, ny, z
+        if abs(z - r) > EPS:
+            self.rapid.append((nx, ny, z, nx, ny, r))
+        self.plunge.append((nx, ny, r, nx, ny, depth))
+        self.rapid.append((nx, ny, depth, nx, ny, r))
+        return nx, ny, r
+
+    @staticmethod
+    def _arc_points(x0, y0, z0, x1, y1, z1, cx, cy, cw):
+        """Tessellate one arc block into points, ending exactly on the endpoint."""
+        a0 = math.atan2(y0 - cy, x0 - cx)
+        a1 = math.atan2(y1 - cy, x1 - cx)
+        sweep = (a0 - a1) if cw else (a1 - a0)
+        sweep %= 2 * math.pi
+        if sweep < 1e-9:
+            sweep = 2 * math.pi          # start == end means a full circle
+        r = math.hypot(x0 - cx, y0 - cy)
+        n = max(2, math.ceil(math.degrees(sweep) / ARC_PLOT_DEG))
+        sign = -1 if cw else 1
+        pts = []
+        for k in range(1, n + 1):
+            if k == n:
+                pts.append((x1, y1, z1))
+            else:
+                ang = a0 + sign * sweep * k / n
+                pts.append((cx + r * math.cos(ang),
+                            cy + r * math.sin(ang),
+                            z0 + (z1 - z0) * k / n))
+        return pts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -506,7 +964,7 @@ class PlotCanvas(FigureCanvas):
 
     _COL_RAPID  = '#ff4444'   # red   — G00 rapid
     _COL_FEED   = '#4488ff'   # blue  — G01/02/03 feed
-    _COL_PLUNGE = '#44cc88'   # green — canned-cycle plunge
+    _COL_PLUNGE = '#44cc88'   # green — drilling plunge
 
     def __init__(self, parent=None) -> None:
         self._fig = Figure(facecolor='#1e1e1e')
@@ -541,7 +999,7 @@ class PlotCanvas(FigureCanvas):
                                   lw=1.2, label='G01/02/03  Feed'))
         if parser.plunge:
             handles.append(Line2D([0],[0], color=self._COL_PLUNGE, ls='-',
-                                  lw=1.8, label='Canned Plunge'))
+                                  lw=1.8, label='Plunge'))
         if handles:
             self.ax.legend(handles=handles, loc='upper left', fontsize=7,
                            facecolor='#2b2b2b', labelcolor='#dddddd',
@@ -645,10 +1103,9 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle('FanucToHurco  —  Hurco BNC Converter + 3D Backplot')
-        self.resize(1440, 820)
+        self.resize(1440, 900)
         self.setStyleSheet(_DARK_STYLE)
 
-        self._conv   = FanucConverter()
         self._parser = BackplotParser()
 
         self._build_ui()
@@ -665,14 +1122,16 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.btn_load    = QPushButton('Load G-Code')
         self.btn_convert = QPushButton('Convert  →')
+        self.btn_verify  = QPushButton('Verify Output')
         self.btn_save    = QPushButton('Save BNC')
         self.btn_clear   = QPushButton('Clear')
-        for btn in (self.btn_load, self.btn_convert, self.btn_save, self.btn_clear):
+        for btn in (self.btn_load, self.btn_convert, self.btn_verify,
+                    self.btn_save, self.btn_clear):
             btn_row.addWidget(btn)
         btn_row.addStretch()
         vlay.addLayout(btn_row)
 
-        # ── Three-panel splitter ──────────────────────────────────────────
+        # ── Three-panel splitter over a messages pane ─────────────────────
         split = QSplitter(Qt.Orientation.Horizontal)
 
         self.input_edit = self._make_editor(
@@ -695,7 +1154,13 @@ class MainWindow(QMainWindow):
         split.addWidget(cv_wrap)
 
         split.setSizes([370, 370, 600])
-        vlay.addWidget(split, stretch=1)
+
+        self.log_edit = self._make_editor(readonly=True)
+        vsplit = QSplitter(Qt.Orientation.Vertical)
+        vsplit.addWidget(split)
+        vsplit.addWidget(self._panel('Messages', self.log_edit))
+        vsplit.setSizes([620, 180])
+        vlay.addWidget(vsplit, stretch=1)
 
         # ── Status bar ────────────────────────────────────────────────────
         self._status = QStatusBar()
@@ -704,6 +1169,7 @@ class MainWindow(QMainWindow):
 
         self.btn_load.clicked.connect(self._on_load)
         self.btn_convert.clicked.connect(self._on_convert)
+        self.btn_verify.clicked.connect(self._on_verify)
         self.btn_save.clicked.connect(self._on_save)
         self.btn_clear.clicked.connect(self._on_clear)
 
@@ -715,6 +1181,7 @@ class MainWindow(QMainWindow):
         if placeholder:
             ed.setPlaceholderText(placeholder)
         ed.setReadOnly(readonly)
+        ed.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         return ed
 
     @staticmethod
@@ -729,6 +1196,33 @@ class MainWindow(QMainWindow):
 
     def _msg(self, text: str) -> None:
         self._status.showMessage(text)
+
+    def _log(self, lines: List[str]) -> None:
+        self.log_edit.setPlainText('\n'.join(lines))
+
+    @staticmethod
+    def _stats_line(stats: Dict) -> str:
+        return (f"{stats['blocks']} blocks, {stats['characters']} characters, "
+                f"{stats['arcs']} arc blocks, worst arc radius error "
+                f"{stats['worst_radius_error']}")
+
+    def _report(self, warns, probs, stats) -> List[str]:
+        out: List[str] = []
+        for msg, where in (warns or {}).items():
+            src = ', '.join(str(x) for x in where[:8] if x)
+            more = f" (+{len(where)-8} more)" if len(where) > 8 else ''
+            out.append(f"NOTE: {msg}" + (f"   [source lines {src}{more}]" if src else ''))
+        if out:
+            out.append('')
+        out.append(self._stats_line(stats))
+        if stats['characters'] > BUFFER_CHARS:
+            out.append(f"Larger than the ~{BUFFER_CHARS:,} character buffer: the control "
+                       "will drip-feed it, so keep the computer link running.")
+        for p in probs:
+            out.append(f"PROBLEM: {p}")
+        if not probs:
+            out.append('Check passed.')
+        return out
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _on_load(self) -> None:
@@ -751,27 +1245,45 @@ class MainWindow(QMainWindow):
             self._msg('Nothing to convert — paste or load G-code first.')
             return
 
-        result = self._conv.convert(src)
-        self.output_edit.setPlainText(result)
+        try:
+            bnc, warns = convert(src, helix_max=HELIX_MAX_DEG)
+            probs, stats = check(bnc)
+        except Exception as exc:                     # keep the GUI alive
+            self._log([f'CONVERSION FAILED: {exc!r}'])
+            self._msg(f'Conversion failed: {exc}')
+            return
 
-        self._parser.parse(result)
+        self.output_edit.setPlainText(bnc)
+        self._parser.parse(bnc)
         self.canvas.update_toolpath(self._parser)
 
-        n_info  = len(self._conv.info)
-        n_err   = len(self._conv.errors)
-        n_segs  = (len(self._parser.rapid) +
-                   len(self._parser.feed)  +
-                   len(self._parser.plunge))
+        self._log(self._report(warns, probs, stats))
 
-        parts = [f'{n_info} conversion(s)', f'{n_segs} plot segment(s)']
-        if n_err:
-            parts.append(f'{n_err} ERROR(S)')
+        n_segs = (len(self._parser.rapid) +
+                  len(self._parser.feed) +
+                  len(self._parser.plunge))
+        parts = [f"{stats['blocks']} blocks",
+                 f'{len(warns)} note(s)',
+                 f'{n_segs} plot segment(s)']
+        parts.append('check passed' if not probs else f'{len(probs)} PROBLEM(S)')
+        self._msg('  |  '.join(parts))
 
-        preview = (self._conv.errors or self._conv.info)[:3]
-        summary = '  |  '.join(parts)
-        if preview:
-            summary += f'   [{" · ".join(preview)}]'
-        self._msg(summary)
+    def _on_verify(self) -> None:
+        text = self.output_edit.toPlainText()
+        if not text.strip():
+            self._msg('Nothing to verify — convert or paste a Hurco file first.')
+            return
+        try:
+            probs, stats = check(text)
+            self._parser.parse(text)
+        except Exception as exc:
+            self._log([f'CHECK FAILED: {exc!r}'])
+            self._msg(f'Check failed: {exc}')
+            return
+        self.canvas.update_toolpath(self._parser)
+        self._log(self._report(None, probs, stats))
+        self._msg(f"{stats['blocks']} blocks  |  " +
+                  ('check passed' if not probs else f'{len(probs)} PROBLEM(S)'))
 
     def _on_save(self) -> None:
         text = self.output_edit.toPlainText()
@@ -784,8 +1296,12 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        if not text.endswith('\n'):
+            text += '\n'
         try:
-            with open(path, 'w', encoding='utf-8') as fh:
+            # CRLF: what the control expects over the serial/DNC link
+            with open(path, 'w', encoding='ascii', errors='replace',
+                      newline='\r\n') as fh:
                 fh.write(text)
             self._msg(f'Saved: {path}')
         except OSError as exc:
@@ -794,6 +1310,7 @@ class MainWindow(QMainWindow):
     def _on_clear(self) -> None:
         self.input_edit.clear()
         self.output_edit.clear()
+        self.log_edit.clear()
         self.canvas.clear_plot()
         self._msg('Cleared.')
 
