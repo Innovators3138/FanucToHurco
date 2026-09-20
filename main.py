@@ -44,6 +44,7 @@ from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 # matplotlib backend MUST be set before any other matplotlib imports
+import numpy as np
 import matplotlib
 matplotlib.use('QtAgg')
 
@@ -57,10 +58,13 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QSplitter,
-    QStatusBar, QFileDialog, QLabel,
+    QStatusBar, QFileDialog, QLabel, QDialog, QMessageBox, QSizePolicy,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QAction
+
+import dncui
+import machines as mach
 
 
 # ═════════════════════════ MACHINE SETTINGS ═════════════════════════════════
@@ -966,11 +970,33 @@ class PlotCanvas(FigureCanvas):
     _COL_FEED   = '#4488ff'   # blue  — G01/02/03 feed
     _COL_PLUNGE = '#44cc88'   # green — drilling plunge
 
+    # Above this many plotted points, rotating swaps in a thinned copy of the
+    # path for the duration of the drag; full detail comes back on release.
+    _DRAG_MAX_POINTS = 30000
+
+    # How much of the (always square) 3-D axes rectangle the cube fills.  Much
+    # past this and the X tick labels run off the bottom of the canvas.
+    _BOX_ZOOM = 1.05
+
+    # Room for the tick labels, in pixels: (side, top, bottom).
+    _MARGIN_PX = (22.0, 10.0, 30.0)
+
     def __init__(self, parent=None) -> None:
         self._fig = Figure(facecolor='#1e1e1e')
         super().__init__(self._fig)
         self.setParent(parent)
+        # Matplotlib does not set a size policy on the canvas, so it defaults
+        # to Preferred and the widget sits at the figure's 640x480 size hint
+        # however much room the pane has.
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(240, 200)
         self.ax = self._fig.add_subplot(111, projection='3d')
+        # One entry per drawn layer: [line, full points, thinned points|None].
+        self._layers: List[list] = []
+        self._coarse = False
+        self.mpl_connect('button_press_event', self._on_press)
+        self.mpl_connect('button_release_event', self._on_release)
         self._reset_axes()
         self.draw()
 
@@ -978,15 +1004,39 @@ class PlotCanvas(FigureCanvas):
     def update_toolpath(self, parser: BackplotParser) -> None:
         self.ax.cla()
         self._reset_axes()
+        self._layers = []
+        self._coarse = False
+
+        built = []      # (layer, runs) until we know how hard to thin
 
         def _draw(segs: List[Segment], color: str, ls: str, lw: float) -> None:
-            for x0, y0, z0, x1, y1, z1 in segs:
-                self.ax.plot([x0, x1], [y0, y1], [z0, z1],
-                             color=color, linestyle=ls, linewidth=lw)
+            # One artist per layer, not per segment: mplot3d re-projects and
+            # re-draws every artist on every mouse-move frame, so a 20k-segment
+            # program drawn segment by segment rotates at under a frame a
+            # second.  The runs are chained into a single point sequence with
+            # NaN breaks, which Matplotlib draws as gaps.
+            runs = self._runs(segs)
+            if not runs:
+                return
+            full = self._flatten(runs)
+            line, = self.ax.plot(*full, color=color, linestyle=ls, linewidth=lw)
+            layer = [line, full, None]
+            self._layers.append(layer)
+            built.append((layer, runs))
 
         _draw(parser.rapid,  self._COL_RAPID,  '--', 0.9)
         _draw(parser.feed,   self._COL_FEED,   '-',  1.2)
         _draw(parser.plunge, self._COL_PLUNGE, '-',  1.8)
+
+        # Thin once, here, so a drag only has to swap in arrays that already
+        # exist.  Beyond this size the redraw is bound by how many pixels the
+        # path covers rather than by its point count, so thinning harder than
+        # this buys nothing.
+        total = sum(len(layer[1][0]) for layer in self._layers)
+        if total > self._DRAG_MAX_POINTS:
+            step = math.ceil(total / self._DRAG_MAX_POINTS)
+            for layer, runs in built:
+                layer[2] = self._flatten(runs, step)
 
         self.ax.scatter([0], [0], [0], color='#ffff44', s=30, zorder=5)
 
@@ -1006,15 +1056,91 @@ class PlotCanvas(FigureCanvas):
                            framealpha=0.85)
 
         self._equalize_axes(parser)
-        self._fig.tight_layout(pad=0.4)
+        self._fit_figure()
         self.draw()
+
+    def resizeEvent(self, event) -> None:
+        # Pixel margins have to be recomputed against the new canvas size.
+        super().resizeEvent(event)
+        self._fit_figure()
 
     def clear_plot(self) -> None:
         self.ax.cla()
         self._reset_axes()
+        self._fit_figure()
+        self._layers = []
+        self._coarse = False
         self.draw()
 
+    # ── drag handling ────────────────────────────────────────────────────────
+    def _on_press(self, event) -> None:
+        """Swap in the thinned path so the rotate stays responsive."""
+        if self._coarse or event.inaxes is not self.ax:
+            return
+        if not any(layer[2] for layer in self._layers):
+            return                      # small enough to rotate at full detail
+        for line, _full, coarse in self._layers:
+            if coarse:
+                line.set_data_3d(*coarse)
+        self._coarse = True              # Matplotlib's own rotate draws it
+
+    def _on_release(self, _event) -> None:
+        if not self._coarse:
+            return
+        for line, full, _coarse in self._layers:
+            line.set_data_3d(*full)
+        self._coarse = False
+        self.draw_idle()
+
     # ── Internal ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _runs(segs: List[Segment]) -> List[Tuple[List, List, List]]:
+        """
+        Segments -> contiguous runs, each `(xs, ys, zs)`.
+
+        Consecutive segments almost always share an endpoint, so a whole
+        contour chains into one run; a segment that starts somewhere else
+        begins a new one.
+        """
+        runs: List[Tuple[List, List, List]] = []
+        xs = ys = zs = None
+        px = py = pz = None
+        for x0, y0, z0, x1, y1, z1 in segs:
+            if (px is None or abs(x0 - px) > EPS or abs(y0 - py) > EPS
+                    or abs(z0 - pz) > EPS):
+                xs, ys, zs = [x0], [y0], [z0]
+                runs.append((xs, ys, zs))
+            xs.append(x1), ys.append(y1), zs.append(z1)
+            px, py, pz = x1, y1, z1
+        return runs
+
+    @staticmethod
+    def _flatten(runs: List[Tuple[List, List, List]], step: int = 1):
+        """
+        Runs -> one `(xs, ys, zs)` point sequence, NaN between runs.
+
+        `step` keeps every nth point of each run, always keeping both of its
+        ends so contours stay closed and the breaks stay in the same places.
+        """
+        nan = float('nan')
+        out: Tuple[List, List, List] = ([], [], [])
+        for run in runs:
+            if step > 1 and len(run[0]) > 2:
+                kept = [axis[::step] for axis in run]
+                if (len(run[0]) - 1) % step:
+                    for axis, keep in zip(run, kept):
+                        keep.append(axis[-1])
+            else:
+                kept = list(run)
+            if out[0]:
+                for axis in out:
+                    axis.append(nan)
+            for axis, keep in zip(out, kept):
+                axis += keep
+        # Arrays, not lists: Line3D.set_data_3d stores what it is given and
+        # the 3-D draw indexes it as an array.
+        return tuple(np.asarray(axis, dtype=float) for axis in out)
+
     def _equalize_axes(self, parser: BackplotParser) -> None:
         """Force X, Y, Z to the same scale so geometry isn't distorted."""
         all_segs = parser.rapid + parser.feed + parser.plunge
@@ -1039,7 +1165,35 @@ class PlotCanvas(FigureCanvas):
         self.ax.set_xlim3d(xm - half, xm + half)
         self.ax.set_ylim3d(ym - half, ym + half)
         self.ax.set_zlim3d(zm - half, zm + half)
-        self.ax.set_box_aspect([1, 1, 1])   # equal physical box (matplotlib ≥ 3.3)
+        # Equal physical box (Matplotlib ≥ 3.3); `zoom` enlarges the cube
+        # inside the axes rectangle and arrived in Matplotlib 3.6.
+        try:
+            self.ax.set_box_aspect([1, 1, 1], zoom=self._BOX_ZOOM)
+        except TypeError:
+            self.ax.set_box_aspect([1, 1, 1])
+
+    def _fit_figure(self) -> None:
+        """
+        Give the axes the whole canvas bar a margin for the tick labels.
+
+        `tight_layout()` cannot lay out 3-D axes — it warns that the margins
+        cannot be made large enough and leaves the default 12% borders in
+        place, which is most of the empty space around a backplot.
+
+        mplot3d's `apply_aspect()` then forces the axes rectangle square
+        whatever we ask for, so on a pane wider than it is tall the plot is
+        sized by the canvas *height*; the side margins only decide where the
+        square sits, and the default anchor centres it.
+
+        The margins are in pixels, not fractions, because a fraction that
+        clears the tick labels on a tall pane is a few pixels on a short one.
+        """
+        w = max(float(self._fig.bbox.width), 1.0)
+        h = max(float(self._fig.bbox.height), 1.0)
+        side, top, bottom = self._MARGIN_PX
+        self._fig.subplots_adjust(
+            left=min(side / w, 0.25), right=1.0 - min(side / w, 0.25),
+            bottom=min(bottom / h, 0.25), top=1.0 - min(top / h, 0.25))
 
     def _reset_axes(self) -> None:
         self.ax.set_facecolor('#2b2b2b')
@@ -1093,6 +1247,40 @@ QStatusBar::item { border: none; }
 QSplitter::handle            { background: #444; }
 QSplitter::handle:horizontal { width: 3px; }
 QSplitter::handle:vertical   { height: 3px; }
+QMenuBar { background: #2b2b2b; color: #d4d4d4; }
+QMenuBar::item:selected { background: #3c3f41; }
+QMenu { background: #2b2b2b; color: #d4d4d4; border: 1px solid #555; }
+QMenu::item:selected   { background: #2d5a8e; }
+QMenu::item:disabled   { color: #777777; }
+QDialog { background: #2b2b2b; }
+QLineEdit {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    border: 1px solid #444;
+    padding: 4px;
+}
+QListWidget, QTableWidget {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    border: 1px solid #444;
+    gridline-color: #333;
+}
+QListWidget::item:selected, QTableWidget::item:selected { background: #2d5a8e; }
+QHeaderView::section {
+    background: #3c3f41;
+    color: #cccccc;
+    border: none;
+    border-right: 1px solid #2b2b2b;
+    padding: 3px 6px;
+}
+QProgressBar {
+    background: #1e1e1e;
+    border: 1px solid #444;
+    text-align: center;
+    color: #d4d4d4;
+    max-height: 14px;
+}
+QProgressBar::chunk { background: #2d5a8e; }
 """
 
 
@@ -1107,8 +1295,11 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(_DARK_STYLE)
 
         self._parser = BackplotParser()
+        self._machines: List[mach.Machine] = mach.load()
+        self._browsers: Dict[str, dncui.MachineBrowserDialog] = {}
 
         self._build_ui()
+        self._build_menu()
 
     # ── Layout ───────────────────────────────────────────────────────────────
     def _build_ui(self) -> None:
@@ -1150,7 +1341,7 @@ class MainWindow(QMainWindow):
         cv_lay.setSpacing(2)
         cv_lay.addWidget(QLabel('3D Backplot'))
         cv_lay.addWidget(nav_toolbar)
-        cv_lay.addWidget(self.canvas)
+        cv_lay.addWidget(self.canvas, stretch=1)   # all the leftover height
         split.addWidget(cv_wrap)
 
         split.setSizes([370, 370, 600])
@@ -1172,6 +1363,83 @@ class MainWindow(QMainWindow):
         self.btn_verify.clicked.connect(self._on_verify)
         self.btn_save.clicked.connect(self._on_save)
         self.btn_clear.clicked.connect(self._on_clear)
+
+    # ── Machines menu ─────────────────────────────────────────────────────────
+    def _build_menu(self) -> None:
+        self._machine_menu = self.menuBar().addMenu('&Machines')
+        self._refresh_machine_menu()
+
+    def _refresh_machine_menu(self) -> None:
+        """Rebuilt whenever the saved machine list changes."""
+        menu = self._machine_menu
+        menu.clear()
+
+        manage = QAction('Manage Machines…', self)
+        manage.triggered.connect(self._on_manage_machines)
+        menu.addAction(manage)
+        menu.addSeparator()
+
+        if not self._machines:
+            empty = QAction('No machines configured', self)
+            empty.setEnabled(False)
+            menu.addAction(empty)
+        for machine in self._machines:
+            act = QAction(f'Browse {machine.label()}…', self)
+            act.triggered.connect(
+                lambda _checked=False, m=machine: self._open_browser(m))
+            menu.addAction(act)
+
+        menu.addSeparator()
+        send = QAction('Send Output to Machine…', self)
+        send.setEnabled(bool(self._machines))
+        send.triggered.connect(self._on_send_output)
+        menu.addAction(send)
+
+    def _on_manage_machines(self) -> None:
+        dlg = dncui.MachineManagerDialog(self, self._machines)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._machines = dlg.machines()
+        try:
+            mach.save(self._machines)
+        except OSError as exc:
+            QMessageBox.warning(self, 'Could not save machines',
+                                f'{mach.config_path()}\n\n{exc}')
+        self._refresh_machine_menu()
+        self._msg(f'{len(self._machines)} machine(s) saved to '
+                  f'{mach.config_path()}')
+
+    def _open_browser(self, machine: mach.Machine,
+                      pending_upload=None) -> None:
+        """One browser per machine — the device only accepts one client."""
+        existing = self._browsers.get(machine.ip)
+        if existing is not None and existing.isVisible():
+            if pending_upload is not None:
+                existing.queue_upload(*pending_upload)
+            else:
+                existing.raise_()
+                existing.activateWindow()
+                self._msg(f'{machine.label()} is already open.')
+            return
+        dlg = dncui.MachineBrowserDialog(machine, self, pending_upload)
+        self._browsers[machine.ip] = dlg
+        dlg.destroyed.connect(
+            lambda _o=None, ip=machine.ip: self._browsers.pop(ip, None))
+        dlg.show()
+
+    def _on_send_output(self) -> None:
+        text = self.output_edit.toPlainText()
+        if not text.strip():
+            self._msg('Nothing to send — run Convert first.')
+            return
+        machine = dncui.choose_machine(self, self._machines)
+        if machine is None:
+            return
+        if not text.endswith('\n'):
+            text += '\n'
+        # Same bytes the Save button writes: ASCII with CRLF for the DNC link.
+        data = text.replace('\n', '\r\n').encode('ascii', errors='replace')
+        self._open_browser(machine, pending_upload=(data, 'PROGRAM.NC'))
 
     # ── UI helpers ────────────────────────────────────────────────────────────
     @staticmethod
@@ -1321,6 +1589,9 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    app.setApplicationName('FanucToHurco')
+    app.setOrganizationName('FanucToHurco')
+    app.setStyleSheet(_DARK_STYLE)   # on the app, so dialogs are styled too
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
