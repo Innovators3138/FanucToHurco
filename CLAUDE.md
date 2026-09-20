@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Desktop GUI (PyQt6 + Matplotlib) that converts Onshape/Fanuc G-code into the Hurco BNC dialect spoken by an AMTS BX-MPU retrofit controller on a Hurco KMB-1 / MB-1 mill, and backplots the result in 3D. `Gcodes.pdf` is the authority for the BX-MPU vocabulary and output format; `program_out.nc` is a real Onshape post output used as a reference input sample.
+Desktop GUI (PyQt6 + Matplotlib) that converts Onshape/Fanuc G-code into the Hurco BNC dialect spoken by an AMTS BX-MPU retrofit controller on a Hurco KMB-1 / MB-1 mill, backplots the result in 3D, and sends it over the network to the shop's Micro DNC drip-feed boxes. `Gcodes.pdf` is the authority for the BX-MPU vocabulary and output format; `program_out.nc` is a real Onshape post output used as a reference input sample.
 
 ## Commands
 
@@ -34,9 +34,33 @@ bp = m.BackplotParser(); bp.parse(out)  # segment counts for the plot
 
 `check()` is the fastest regression signal: it re-reads the output from scratch and should report no problems for any valid input. To drive the GUI itself without a display, set `QT_QPA_PLATFORM=offscreen`, build `MainWindow()`, and `.click()` the buttons.
 
+The DNC protocol client has its own CLI, which is the quickest way to poke a real machine:
+
+```bash
+python3 qsdnc.py 192.168.1.50 info
+python3 qsdnc.py 192.168.1.50 ls "\\PROGRAMS"
+python3 qsdnc.py 192.168.1.50 put out.nc "\\PROGRAMS\\PART1.NC"
+python3 qsdnc.py 192.168.1.50 run "\\PROGRAMS\\PART1.NC"
+```
+
+To test protocol changes without hardware, stand up a UDP socket that answers the opcodes in §3 of the protocol spec; `qsdnc.QSClient(ip, port=…, bind_port=0)` will talk to it on loopback. `qsdnc.PORT` and `qsdnc.BIND_PORT` are read at connect time by `dncui.ClientThread`, so patching them redirects the whole GUI at a fake device.
+
 ## Architecture
 
-Everything lives in [main.py](main.py), in five parts:
+Four modules. The converter and the backplot live in [main.py](main.py) together with the main window; the machine-transfer feature is split out so the protocol can be tested and scripted without Qt:
+
+| Module | Role |
+|---|---|
+| [main.py](main.py) | converter, output checker, backplot, main window |
+| [qsdnc.py](qsdnc.py) | Micro DNC / QS Explorer UDP protocol client — Qt-free, blocking, has its own CLI |
+| [machines.py](machines.py) | the saved machine list (name + IP), JSON in the per-user config dir |
+| [dncui.py](dncui.py) | Qt layer: worker thread, machine manager, remote file browser |
+
+PyInstaller follows the imports from `main.py`, so the build needs no changes for the new modules.
+
+### Converter side
+
+[main.py](main.py) is in five parts:
 
 1. **Machine settings block** (top of the file) — the tuning knobs; see below.
 2. **`Converter`** — the Fanuc→BNC state machine. `convert(text)` feeds each source line to `Converter.process()` and returns `(output_text, warnings)`, where warnings is an `OrderedDict` of `{message: [source line numbers]}`.
@@ -80,6 +104,36 @@ The constants at the top of `main.py` are the machine-specific knobs, and severa
 - `M30`/`M02` triggers the end sequence; if the source has neither, one is appended with a warning.
 - Saving from the GUI writes ASCII with CRLF line endings, which is what the control expects over the DNC link.
 
+## Machine transfer (DNC)
+
+The drip-feed boxes speak a protocol reverse-engineered from QS Explorer 4.06. It is TFTP-*shaped* but is not TFTP, and the differences are the part that bites:
+
+- **Block numbers are 32-bit**, not TFTP's 16-bit. A stock TFTP library cannot talk to these devices.
+- **Both ends use port 69** — there is no ephemeral TID negotiation. Binding source port 69 needs root on macOS and Linux, so `QSClient.open()` tries it `BIND_RETRIES` times and then falls back to an ephemeral port, reporting what it actually got in `local_port`. The browser surfaces that in its status line, because if the device turns out to insist on source port 69 that message is the only clue.
+- **One client at a time.** Opcode `0x63` means another PC holds the device; it is raised as `DncBusy` from any call. `MainWindow._open_browser` keeps one browser per IP for the same reason.
+- **Downloads need the file size up front.** There is no EOF marker, so the block count comes from the directory listing — `download_path()` does the lookup, `download()` takes the size.
+- **`0x12 WaitACK` can precede any filesystem ACK.** `_command()` keeps waiting after one *without resending*, since re-sending a delete or rename could run it twice.
+- **The device pushes unsolicited packets** (`0x1B` entered-DNC-mode, `0x18` startup-copy) that can land mid-exchange. Every wait loop steps over them and records them in `QSClient.notices`; the browser shows them in its message line.
+- Strings are one byte per character, so **filenames must stay ASCII**. Paths use `\`, have no drive letter, and the root is the empty string — the `0:` in the UI is display only.
+
+**No protocol call ever runs on the GUI thread.** Timeouts are 800 ms with up to 10 retries, so a call can block for seconds. `dncui.ClientThread` owns the socket and runs every call, taking work as `(tag, fn)` and emitting the tag back with the result; `MachineBrowserDialog` dispatches on the tag to a `_done_<tag>` method. Adding an operation means adding a `self._submit()` call and the matching `_done_` handler — never calling `QSClient` directly from a slot; `_submit()` refuses while the link is down, so a `_done_` handler only runs for a call that actually went out.
+
+**A browser stays open whether or not the device answers.** The status line at the top of the dialog is the connection state — green "Connected to <name> at <ip>", red "Not connected to <name>" with the reason — and a failed connection greys out the controls and offers Reconnect instead of popping an error and closing the window. Three consecutive failed status polls (the 1 Hz tick, one in flight at a time) count as the device going away. Because a silent device costs retries × timeout seconds per call, `QSClient` takes a `should_stop` callback checked between attempts and raises `DncAborted`; that is what lets `ClientThread.shutdown()` return promptly when the dialog is closed mid-connect. A worker that still will not stop is cut loose with `setParent(None)` and deleted on `finished` — destroying a running `QThread` aborts the process.
+
+The machine list is JSON in the per-user config directory (`machines.config_path()`), not in the repo. `machines.import_device_dat()` reads QS Explorer's own `Device.dat` for migration.
+
 ### Backplot colors
 
 G00 rapid = red dashed, G01/G02/G03 feed = blue solid, plunge = green solid, origin = yellow dot. Axes are forced to equal scale by `_equalize_axes()` so geometry isn't distorted.
+
+### Backplot performance
+
+**Three artists, not one per segment.** mplot3d re-projects and re-draws every artist on every mouse-move frame, so plotting each segment with its own `ax.plot()` made rotation unusable — 0.8 fps at 18k segments, 0.12 fps at 112k. `_runs()` chains segments that share an endpoint into contiguous runs and `_flatten()` joins the runs into one point sequence per layer with NaN between them, which Matplotlib draws as a break. Keep it to one artist per layer; adding a per-segment or per-move artist is what regresses this.
+
+`_flatten()` returns numpy arrays because `Line3D.set_data_3d` stores what it is handed and the 3-D draw indexes it as an array — lists raise `AttributeError: 'list' object has no attribute 'shape'` at draw time, not at call time.
+
+**The canvas has to be told it may grow.** Matplotlib sets no size policy on `FigureCanvasQTAgg`, so it defaults to `Preferred` and the widget sits at the figure's 640x480 size hint however large the pane is — leaving the leftover height to whatever else is in the layout (it went to the `3D Backplot` label). `PlotCanvas.__init__` sets `Expanding` and the layout gives the canvas `stretch=1`.
+
+**`tight_layout()` does not work on 3-D axes.** It warns that the margins cannot be made large enough and leaves the default 12% borders, which was most of the empty space around the plot. `_fit_figure()` sets the margins directly, in pixels rather than fractions (a fraction that clears the tick labels on a tall pane is a few pixels on a short one), and `resizeEvent` re-applies it. mplot3d's `apply_aspect()` forces the axes rectangle square whatever aspect is asked for, so on a pane wider than it is tall the plot is sized by the canvas *height* and the side margins only decide where the square sits. `_BOX_ZOOM` then enlarges the cube inside that square; past about 1.05 with these margins the X tick labels run off the bottom on a short wide pane.
+
+Past `_DRAG_MAX_POINTS` the canvas swaps in a thinned copy of the path on `button_press_event` and restores full detail on release (`_on_press` / `_on_release`); both arrays are built once in `update_toolpath()`, so a drag only swaps references. Beyond roughly 30k points the frame time is bound by how many pixels the path covers rather than by its point count, so thinning harder than that buys nothing — measured, not assumed.
