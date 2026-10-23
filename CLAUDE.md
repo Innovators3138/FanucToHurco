@@ -22,11 +22,11 @@ pyinstaller --onefile --windowed --name FanucToHurco \
     main.py
 ```
 
-Pushing to `main` triggers [.github/workflows/build-windows.yml](.github/workflows/build-windows.yml), which builds `dist/FanucToHurco.exe` on `windows-latest` and uploads it as an artifact. Every push and pull request runs the tests in [.github/workflows/tests.yml](.github/workflows/tests.yml), on the same Python (3.12) as the build.
+Pushing to `main` triggers [.github/workflows/build-windows.yml](.github/workflows/build-windows.yml), which builds `dist/FanucToHurco.exe` on `windows-latest` and uploads it as an artifact. Every pull request, and every push to `main`, runs the tests in [.github/workflows/tests.yml](.github/workflows/tests.yml), on the same Python (3.12) as the build.
 
 ### Tests
 
-[tests/](tests/) is pytest, one file per module (`test_converter`, `test_check`, `test_backplot`, `test_find`, `test_qsdnc`, `test_dncui`, `test_machines`). `conftest.py` sets `QT_QPA_PLATFORM=offscreen` before anything imports Qt.
+[tests/](tests/) is pytest, one file per module (`test_converter`, `test_check`, `test_backplot`, `test_find`, `test_codes`, `test_qsdnc`, `test_dncui`, `test_machines`). `conftest.py` sets `QT_QPA_PLATFORM=offscreen` before anything imports Qt.
 
 - **Converter tests use `check()` as the oracle**: the `run()` helper fails any test whose output `check()` objects to, so every conversion test is also a format test. `test_check.py` goes the other way, breaking known-good output one way at a time to prove `check()` notices.
 - **[tests/fake_device.py](tests/fake_device.py) is a Micro DNC on loopback UDP**, with an in-memory filesystem that behaves like the real box (index-addressed ReadDir, case-insensitive names, FR codes). Its knobs (`busy`, `wait_ack`, `drop`, `push`, `error`, `owned`, `silent`) reproduce the awkward behaviours; `received` logs every packet for asserting how many times something was sent. When the real device surprises you, teach the fake first and write the failing test.
@@ -78,7 +78,7 @@ PyInstaller follows the imports from `main.py`, so the build needs no changes fo
 2. **`Converter`** — the Fanuc→BNC state machine. `convert(text)` feeds each source line to `Converter.process()` and returns `(output_text, warnings)`, where warnings is an `OrderedDict` of `{message: [source line numbers]}`.
 3. **`check(text)`** — an *independent* re-reader of BNC output returning `(problems, stats)`. It deliberately shares no code with the converter beyond the settings constants, so it catches converter bugs rather than confirming them.
 4. **`BackplotParser`** / **`PlotCanvas`** — re-parse the converted output into `rapid` / `feed` / `plunge` segment lists and draw them on embedded 3D Matplotlib axes.
-5. **`MainWindow`** — Load / Convert / Verify / Save / Clear, over a three-pane splitter (input, output, backplot) with a Messages pane beneath. The input and output editors each have a `FindBar` (Ctrl+F, Enter/F3, Shift+Enter/Shift+F3, Esc). Its matching is `find_spans()`, which is headless-testable: a query that is one letter plus a number is matched by value through `WORD` outside comments (`G1` finds `G01`/`G1.` but not `G10`); anything else is a case-insensitive text search.
+5. **`MainWindow`** — Load / Convert / Verify / Save / Clear, over a three-pane splitter (input, output, backplot) with a Messages pane beneath. The input and output editors each have a `FindBar` (Ctrl+F, Enter/F3, Shift+Enter/Shift+F3, Esc). Its matching is `find_spans()`, which is headless-testable: a query that is one letter plus a number is matched by value through `WORD` outside comments (`G1` finds `G01`/`G1.` but not `G10`); anything else is a case-insensitive text search. Beside Messages, `CodesPanel` lists every G, M and T code with its input and output counts (amber: input only, green: output only); clicking a count calls that side's `FindBar.find()`, and clicking again steps on. Hovering a code shows `code_description()`, from `BX_CODES` (wording from `Gcodes.pdf`) and `FANUC_CODES`; tests require a description for everything in `ALLOWED_G`/`ALLOWED_M` and for every Fanuc code the converter handles, so adding to either list means adding its description. It counts through `code_words()`, the same tokenizer `find_spans()` uses, so a code it lists is always one the find bar can find.
 
 ### Invariants worth knowing before editing
 
