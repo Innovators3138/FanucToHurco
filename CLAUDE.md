@@ -66,7 +66,7 @@ PyInstaller follows the imports from `main.py`, so the build needs no changes fo
 2. **`Converter`** — the Fanuc→BNC state machine. `convert(text)` feeds each source line to `Converter.process()` and returns `(output_text, warnings)`, where warnings is an `OrderedDict` of `{message: [source line numbers]}`.
 3. **`check(text)`** — an *independent* re-reader of BNC output returning `(problems, stats)`. It deliberately shares no code with the converter beyond the settings constants, so it catches converter bugs rather than confirming them.
 4. **`BackplotParser`** / **`PlotCanvas`** — re-parse the converted output into `rapid` / `feed` / `plunge` segment lists and draw them on embedded 3D Matplotlib axes.
-5. **`MainWindow`** — Load / Convert / Verify / Save / Clear, over a three-pane splitter (input, output, backplot) with a Messages pane beneath.
+5. **`MainWindow`** — Load / Convert / Verify / Save / Clear, over a three-pane splitter (input, output, backplot) with a Messages pane beneath. The input and output editors each have a `FindBar` (Ctrl+F, Enter/F3, Shift+Enter/Shift+F3, Esc). Its matching is `find_spans()`, which is headless-testable: a query that is one letter plus a number is matched by value through `WORD` outside comments (`G1` finds `G01`/`G1.` but not `G10`); anything else is a case-insensitive text search.
 
 ### Invariants worth knowing before editing
 
