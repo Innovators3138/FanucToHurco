@@ -697,13 +697,44 @@ class MachineBrowserDialog(QDialog):
             return
         self._start_upload(data, os.path.basename(path))
 
+    def _ask_name(self, title: str, label: str, text: str = '') -> Optional[str]:
+        """
+        Prompt for a name the device can store, explaining and offering a
+        cleaned-up version until one is given or the prompt is cancelled.
+        """
+        while True:
+            name, ok = QInputDialog.getText(self, title, label, text=text)
+            if not ok:
+                return None
+            name = name.strip()
+            problem = qsdnc.name_problem(name)
+            if problem is None:
+                return name
+            suggestion = qsdnc.clean_name(name)
+            QMessageBox.warning(
+                self, title, problem + (f'\n\nSuggested instead: {suggestion}'
+                                        if suggestion and suggestion != name else ''))
+            text = suggestion or name
+
     def _start_upload(self, data: bytes, suggested: str) -> None:
-        name, ok = QInputDialog.getText(
-            self, 'Upload', f'Save on the machine as (in {self._display_path()}):',
-            text=suggested.upper())
-        if not ok or not name.strip():
+        name = self._ask_name(
+            'Upload', f'Save on the machine as (in {self._display_path()}):',
+            qsdnc.clean_name(suggested).upper() or 'PROGRAM.NC')
+        if name is None:
             return
-        remote = qsdnc.join(self._path, name.strip())
+        clash = next((e for e in self._entries if e.name.lower() == name.lower()),
+                     None)
+        if clash is not None and clash.is_dir:
+            QMessageBox.warning(self, 'Upload',
+                                f'There is already a folder named "{clash.name}" here.')
+            return
+        if clash is not None and QMessageBox.question(
+                self, 'Replace file',
+                f'"{clash.name}" ({_fmt_size(clash.size)}) is already on '
+                f'{self._machine.name}.\n\nReplace it?'
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        remote = qsdnc.join(self._path, name)
         tag = 'upload'
         link = self._link()
         if link is None:
@@ -737,10 +768,10 @@ class MachineBrowserDialog(QDialog):
 
     # ── slots: filesystem ────────────────────────────────────────────────────
     def _on_mkdir(self) -> None:
-        name, ok = QInputDialog.getText(self, 'New Folder', 'Folder name:')
-        if not ok or not name.strip():
+        name = self._ask_name('New Folder', 'Folder name:')
+        if name is None:
             return
-        target = qsdnc.join(self._path, name.strip())
+        target = qsdnc.join(self._path, name)
         self._set_busy(True, f'Creating {target}…')
         self._submit('mkdir', lambda c: c.mkdir(target))
 
@@ -748,12 +779,11 @@ class MachineBrowserDialog(QDialog):
         entry = self._selected_entry()
         if entry is None:
             return
-        name, ok = QInputDialog.getText(self, 'Rename', 'New name:',
-                                        text=entry.name)
-        if not ok or not name.strip() or name.strip() == entry.name:
+        name = self._ask_name('Rename', 'New name:', entry.name)
+        if name is None or name == entry.name:
             return
         old = qsdnc.join(self._path, entry.name)
-        new = qsdnc.join(self._path, name.strip())
+        new = qsdnc.join(self._path, name)
         self._set_busy(True, f'Renaming {entry.name}…')
         self._submit('rename', lambda c: c.rename(old, new))
 

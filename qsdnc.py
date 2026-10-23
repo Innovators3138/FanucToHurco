@@ -22,6 +22,7 @@ import socket
 import struct
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -132,6 +133,14 @@ class DncBusy(DncError):
     """Opcode 0x63 — another PC already owns this device."""
 
 
+class DncStillBusy(DncTimeout):
+    """The device kept answering "being busy" for BUSY_WAIT seconds."""
+
+
+class DncBadName(DncError):
+    """A name the device would store corrupted or refuse."""
+
+
 class DncRemoteError(DncError):
     """Opcode 0x05 — the device sent a TFTP-style error packet."""
 
@@ -164,6 +173,64 @@ def parent_of(path: str) -> str:
 
 def basename(path: str) -> str:
     return path.rstrip('\\').rsplit('\\', 1)[-1]
+
+
+# ───────────────────────────── file names ───────────────────────────────────
+# Names go over the wire one byte per character and land in FatFs, so a
+# non-ASCII character is stored as something else, and FAT refuses its own
+# reserved characters.  FatFs also drops leading spaces and trailing dots and
+# spaces, so such a name would come back from the listing different from the
+# one that was sent.
+FAT_RESERVED = '\\/:*?"<>|'
+_NAME_SUBST = {
+    'Ø': 'O', 'ø': 'o', 'Æ': 'AE', 'æ': 'ae', 'ß': 'ss', 'Ð': 'D', 'ð': 'd',
+    'Þ': 'TH', 'þ': 'th', 'Ł': 'L', 'ł': 'l', '°': 'deg', '×': 'x',
+    '±': '+-', '–': '-', '—': '-', '‘': "'", '’': "'", '“': '', '”': '',
+}
+
+
+def name_problem(name: str) -> Optional[str]:
+    """Why the device cannot store `name` as given, or None if it can."""
+    if not name.strip():
+        return 'The name is empty.'
+    if name in ('.', '..'):
+        return f'"{name}" is not a usable name.'
+    odd = ''.join(dict.fromkeys(ch for ch in name if ord(ch) > 126))
+    if odd:
+        return (f'The Micro DNC cannot store {odd} in a name. Use plain '
+                'letters, digits, spaces and punctuation.')
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        return 'The name contains control characters.'
+    bad = ''.join(dict.fromkeys(ch for ch in name if ch in FAT_RESERVED))
+    if bad:
+        return f'A name cannot contain {" ".join(bad)}'
+    if name != name.lstrip(' ') or name != name.rstrip('. '):
+        return 'A name cannot start with a space or end with a dot or space.'
+    if len(name) > 255:
+        return 'The name is longer than 255 characters.'
+    return None
+
+
+def clean_name(name: str) -> str:
+    """
+    The nearest name the device can store: accents dropped, a few symbols
+    spelled out, anything else unusable replaced with '_'.  May return ''.
+    """
+    name = ''.join(_NAME_SUBST.get(ch, ch) for ch in name)
+    name = unicodedata.normalize('NFKD', name)
+    name = ''.join(ch for ch in name if not unicodedata.combining(ch))
+    out = []
+    for ch in name:
+        if ord(ch) < 32 or ord(ch) == 127:
+            continue
+        out.append('_' if ord(ch) > 126 or ch in FAT_RESERVED else ch)
+    return ''.join(out).strip(' ').rstrip('. ')[:255]
+
+
+def _check_name(path: str) -> None:
+    problem = name_problem(basename(path))
+    if problem:
+        raise DncBadName(f'{basename(path)!r}: {problem}')
 
 
 def _z(text: str) -> bytes:
@@ -382,7 +449,9 @@ class QSClient:
             if busy_until is None:
                 busy_until = now + BUSY_WAIT
             elif now > busy_until:
-                raise DncTimeout(f'{self.ip} stayed busy for {BUSY_WAIT:.0f} s')
+                raise DncStillBusy(
+                    f'{self.ip} is busy. If the file explorer menu is open on '
+                    'the Micro DNC, close it and try again.')
             time.sleep(BUSY_PAUSE)
         raise DncTimeout(f'no response to opcode 0x{op:02X} from {self.ip}')
 
@@ -469,7 +538,10 @@ class QSClient:
         return index, Entry(name, int.from_bytes(tail[3:7], 'big'), tail[2])
 
     # ── mutating filesystem operations ───────────────────────────────────────
+    # Anything that creates a name checks it first; deleting or reading an
+    # existing one does not, so odd names already on the card stay reachable.
     def mkdir(self, path: str) -> None:
+        _check_name(path)
         _op, code, _b, _r = self._command(OP_MKDIR, _z(path), (R_MKDIRACK,))
         self._check_fr(code, f'create folder {path}')
 
@@ -482,6 +554,7 @@ class QSClient:
         self._check_fr(code, f'delete folder {path}')
 
     def rename(self, old: str, new: str) -> None:
+        _check_name(new)
         _op, code, _b, _r = self._command(OP_RENAME, _z(old) + _z(new),
                                           (R_RENAMEACK,))
         self._check_fr(code, f'rename {old}')
@@ -492,6 +565,7 @@ class QSClient:
     # ── transfers ────────────────────────────────────────────────────────────
     def upload(self, path: str, data: bytes, progress: ProgressFn = None) -> int:
         """PC → device.  Returns the number of blocks sent."""
+        _check_name(path)
         self._command(OP_WRQ, _z(path), (R_DATAACK,), retries=LONG_CMD_RETRIES)
 
         total = math.ceil(len(data) / BLOCK)
