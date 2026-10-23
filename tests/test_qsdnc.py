@@ -177,7 +177,7 @@ def test_brief_busy_is_resent_quickly_and_not_reported(device):
 def test_endless_busy_gives_up(client, device, monkeypatch):
     monkeypatch.setattr(qsdnc, 'BUSY_WAIT', 0.3)
     device.busy = -1
-    with pytest.raises(DncTimeout, match='stayed busy'):
+    with pytest.raises(qsdnc.DncStillBusy, match='file explorer menu'):
         client.list_dir()
 
 
@@ -232,6 +232,59 @@ def test_should_stop_aborts_between_retries(device):
         with pytest.raises(DncAborted):
             c.device_info()
         assert time.monotonic() - t < 0.1
+
+
+# ── names ────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize('name', [
+    'PART.NC', 'Drill Pickup Plate.nc', "Bob's (v2) #3 [a]+b=c.nc", 'X' * 255])
+def test_storable_names(name):
+    assert qsdnc.name_problem(name) is None
+
+
+@pytest.mark.parametrize('name, why', [
+    ('', 'empty'),
+    ('..', 'not a usable name'),
+    ('Bracket Ø10.nc', 'cannot store Ø'),
+    ('Part\x01.nc', 'control characters'),
+    ('a/b?.nc', 'cannot contain / ?'),
+    ('PART.', 'end with a dot'),
+    (' PART.NC', 'start with a space'),
+    ('X' * 256, 'longer than 255'),
+])
+def test_unstorable_names(name, why):
+    assert why in qsdnc.name_problem(name)
+
+
+@pytest.mark.parametrize('name, cleaned', [
+    ('Bracket Ø10 – rev°2.nc', 'Bracket O10 - revdeg2.nc'),
+    ('Café Plätte.nc', 'Cafe Platte.nc'),
+    ('‘quoted’ “part”.nc', "'quoted' part.nc"),
+    ('a/b:c*.nc', 'a_b_c_.nc'),
+    ('部品.nc', '__.nc'),
+    ('  PART.NC.. ', 'PART.NC'),
+    ('…', ''),                         # nothing storable is left
+])
+def test_clean_name(name, cleaned):
+    assert qsdnc.clean_name(name) == cleaned
+    assert cleaned == '' or qsdnc.name_problem(cleaned) is None
+
+
+@pytest.mark.parametrize('call', [
+    lambda c: c.upload('\\Bracket Ø10.nc', b'x'),
+    lambda c: c.mkdir('\\jobs?'),
+    lambda c: c.rename('\\A.NC', '\\Á.NC'),
+])
+def test_bad_names_are_refused_before_anything_is_sent(client, device, call):
+    device.add_file('A.NC', b'')
+    with pytest.raises(qsdnc.DncBadName):
+        call(client)
+    assert device.received == []
+
+
+def test_existing_odd_names_can_still_be_deleted(client, device):
+    device.add_file('Bad?.NC', b'')
+    client.delete_file('\\Bad?.NC')
+    assert device.file('Bad?.NC') is None
 
 
 # ── path helpers ─────────────────────────────────────────────────────────────
