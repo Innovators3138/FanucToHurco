@@ -40,8 +40,8 @@ PyInstaller (single-file, no console window):
 import math
 import re
 import sys
-from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
+from collections import Counter, OrderedDict
+from typing import Dict, Iterator, List, Optional, Tuple
 
 # matplotlib backend MUST be set before any other matplotlib imports
 import numpy as np
@@ -59,7 +59,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QSplitter,
     QStatusBar, QFileDialog, QLabel, QDialog, QMessageBox, QSizePolicy,
-    QLineEdit,
+    QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from PyQt6.QtCore import Qt, QEvent, QTimer
 from PyQt6.QtGui import QFont, QAction, QColor, QKeySequence, QShortcut, QTextCursor
@@ -1292,6 +1292,27 @@ CODE_QUERY = re.compile(r'\s*([A-Za-z])\s*([-+]?(?:\d+\.?\d*|\.\d+))\s*$')
 COMMENT = re.compile(r'\([^)\n]*\)?|;[^\n]*')
 
 
+def code_words(text: str) -> Iterator[Tuple[str, float, int, int]]:
+    """(letter, value, start, end) of every word in `text` outside comments."""
+    # One character in, one character out, so offsets still line up.
+    upper = text.encode('ascii', 'replace').decode('ascii').upper()
+    masked = COMMENT.sub(lambda c: ' ' * len(c.group()), upper)
+    for w in WORD.finditer(masked):
+        yield w.group(1), float(w.group(2)), w.start(), w.end()
+
+
+def code_counts(text: str, letters: str = 'GMT') -> Counter:
+    """How often each code is used, keyed (letter, value): G1 and G01 are one."""
+    return Counter((L, v) for L, v, _s, _e in code_words(text) if L in letters)
+
+
+def code_label(letter: str, value: float) -> str:
+    """G and M codes two-digit as the output writes them; T plain; G91.1 kept."""
+    if value != int(value):
+        return f'{letter}{value:g}'
+    return f'{letter}{int(value):02d}' if letter in 'GM' else f'{letter}{int(value)}'
+
+
 def find_spans(text: str, query: str) -> Tuple[List[Tuple[int, int]], bool]:
     """
     (start, end) of every match of `query` in `text`, and whether it was
@@ -1307,12 +1328,8 @@ def find_spans(text: str, query: str) -> Tuple[List[Tuple[int, int]], bool]:
     code = CODE_QUERY.match(query)
     if code:
         letter, value = code.group(1).upper(), float(code.group(2))
-        # One character in, one character out, so offsets still line up.
-        upper = text.encode('ascii', 'replace').decode('ascii').upper()
-        masked = COMMENT.sub(lambda c: ' ' * len(c.group()), upper)
-        return [(w.start(), w.end()) for w in WORD.finditer(masked)
-                if w.group(1) == letter and abs(float(w.group(2)) - value) < EPS
-                ], True
+        return [(s, e) for L, v, s, e in code_words(text)
+                if L == letter and abs(v - value) < EPS], True
     hay, needle = text.lower(), query.lower()
     spans, at = [], hay.find(needle)
     while at >= 0:
@@ -1382,6 +1399,17 @@ class FindBar(QWidget):
         self.hide()
         self.editor.setExtraSelections([])
         self.editor.setFocus()
+
+    def find(self, query: str) -> None:
+        """Search for `query` from outside the bar; asking again steps on."""
+        if self.isVisible() and self.field.text() == query and self.spans:
+            self.step(+1)
+            return
+        self.show()
+        if self.field.text() != query:
+            self.field.setText(query)        # textChanged runs the search
+        else:
+            self._search(move=True)
 
     def step(self, delta: int) -> None:
         if not self.isVisible():
@@ -1460,6 +1488,187 @@ class FindBar(QWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Codes-used panel
+# ─────────────────────────────────────────────────────────────────────────────
+# What each code does.  BX-MPU wording follows Gcodes.pdf (the AMTS sheet);
+# codes the BX-MPU does not take carry their usual Fanuc mill meaning, and a
+# code that means something different on each gets both.
+BX_CODES = {
+    ('G', 0): 'Rapid traverse',
+    ('G', 1): 'Linear interpolation (straight feed move)',
+    ('G', 2): 'Clockwise circular and helical interpolation',
+    ('G', 3): 'Counterclockwise circular and helical interpolation',
+    ('G', 4): 'Dwell (one-shot)',
+    ('G', 9): 'Precision cornering (one-shot)',
+    ('G', 17): 'XY plane selection',
+    ('G', 40): 'Cutter compensation off',
+    ('G', 41): 'Cutter compensation left',
+    ('G', 42): 'Cutter compensation right',
+    ('G', 61): 'Precision cornering mode on',
+    ('G', 64): 'Precision cornering mode off',
+    ('G', 70): 'English (inch) units',
+    ('G', 71): 'Metric units',
+    ('G', 75): 'Multi-quadrant circular interpolation mode (power-up default)',
+    ('G', 80): 'Fixed cycle cancel',
+    ('G', 81): 'Drill cycle',
+    ('G', 82): 'Drill with dwell cycle',
+    ('G', 83): 'Deep hole (peck) drilling cycle',
+    ('G', 84): 'Tapping cycle',
+    ('G', 85): 'Boring cycle',
+    ('G', 90): 'Absolute positioning',
+    ('G', 91): 'Incremental positioning',
+    ('M', 0): 'Program stop',
+    ('M', 1): 'Planned (optional) stop',
+    ('M', 2): 'End of program',
+    ('M', 3): 'Spindle on clockwise',
+    ('M', 4): 'Spindle on counterclockwise',
+    ('M', 5): 'Spindle off',
+    ('M', 6): 'Tool change',
+    ('M', 7): 'Mist coolant on',
+    ('M', 8): 'Flood coolant on',
+    ('M', 9): 'Coolant off',
+    ('M', 25): 'Z retract to machine home',
+}
+FANUC_CODES = {
+    ('G', 10): 'Programmable data input (sets offsets)',
+    ('G', 18): 'ZX plane selection',
+    ('G', 19): 'YZ plane selection (the AMTS sheet lists G19 as XZ)',
+    ('G', 20): 'Inch units',
+    ('G', 21): 'Metric units',
+    ('G', 28): 'Return to machine home (reference point)',
+    ('G', 30): 'Return to second reference point',
+    ('G', 43): 'Tool length compensation +',
+    ('G', 44): 'Tool length compensation -',
+    ('G', 49): 'Tool length compensation cancel',
+    ('G', 52): 'Local coordinate system',
+    ('G', 53): 'Move in machine coordinates',
+    ('G', 54): 'Work offset 1',
+    ('G', 55): 'Work offset 2',
+    ('G', 56): 'Work offset 3',
+    ('G', 57): 'Work offset 4',
+    ('G', 58): 'Work offset 5',
+    ('G', 59): 'Work offset 6',
+    ('G', 65): 'Macro call',
+    ('G', 68): 'Coordinate rotation',
+    ('G', 69): 'Coordinate rotation cancel',
+    ('G', 70): 'Lathe finishing cycle; not used on a mill',
+    ('G', 71): 'Lathe roughing cycle; not used on a mill',
+    ('G', 73): 'High-speed peck drilling cycle',
+    ('G', 74): 'Left-hand (counter) tapping cycle',
+    ('G', 75): 'Grinding cycle; not used on a mill',
+    ('G', 76): 'Fine boring cycle',
+    ('G', 86): 'Boring cycle, spindle stops at the bottom',
+    ('G', 87): 'Back boring cycle',
+    ('G', 88): 'Boring cycle with manual retract',
+    ('G', 89): 'Boring cycle with dwell',
+    ('G', 90.1): 'Arc centers I/J absolute',
+    ('G', 91.1): 'Arc centers I/J incremental',
+    ('G', 92): 'Set work coordinates',
+    ('G', 94): 'Feed per minute',
+    ('G', 95): 'Feed per revolution',
+    ('G', 98): 'Canned cycle returns to the initial Z',
+    ('G', 99): 'Canned cycle returns to the R plane',
+    ('M', 19): 'Spindle orient',
+    ('M', 29): 'Rigid tapping',
+    ('M', 30): 'End of program and rewind',
+    ('M', 98): 'Call subprogram',
+    ('M', 99): 'Return from subprogram',
+}
+
+
+def code_description(letter: str, value: float) -> str:
+    """One line per dialect that defines the code, for the panel's tooltip."""
+    if letter == 'T':
+        return f'Tool {int(value)}: the tool the next M06 loads'
+    key = (letter, value)
+    bx, fanuc = BX_CODES.get(key), FANUC_CODES.get(key)
+    if bx and fanuc:
+        return f'Hurco BX: {bx}\nFanuc: {fanuc}'
+    if bx:
+        return bx
+    if fanuc:
+        return f'{fanuc} (Fanuc only; the BX-MPU does not use it)'
+    return 'Not a code the BX-MPU or a standard Fanuc mill defines'
+class CodesPanel(QWidget):
+    """
+    Every G, M and T code in the input and the output with how often each is
+    used, so what the converter dropped or added shows at a glance.  Clicking
+    a count finds that code in its editor; clicking again steps to the next.
+    """
+
+    DROPPED = QColor('#e0a060')    # in the input only: removed or replaced
+    ADDED = QColor('#88c888')      # in the output only: written by the converter
+
+    def __init__(self, sides: List[Tuple[str, QTextEdit, 'FindBar']],
+                 parent=None) -> None:
+        super().__init__(parent)
+        self.sides = sides
+        self.keys: List[Tuple[str, float]] = []
+        self.counts: List[Counter] = [Counter() for _ in sides]
+
+        self.table = QTableWidget(0, 1 + len(sides))
+        self.table.setHorizontalHeaderLabels(['Code'] + [s[0] for s in sides])
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(20)   # list, not form
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self.table.cellClicked.connect(self._on_click)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addWidget(QLabel('Codes Used  —  click a count to find it'))
+        lay.addWidget(self.table)
+
+        self._refresh = QTimer(self)
+        self._refresh.setSingleShot(True)
+        self._refresh.setInterval(300)
+        self._refresh.timeout.connect(self.refresh)
+        for _name, editor, _bar in sides:
+            editor.textChanged.connect(self._refresh.start)
+
+    def refresh(self) -> None:
+        self.counts = [code_counts(editor.toPlainText())
+                       for _n, editor, _b in self.sides]
+        order = {L: i for i, L in enumerate('GMT')}
+        self.keys = sorted(set().union(*self.counts),
+                           key=lambda k: (order[k[0]], k[1]))
+        self.table.setRowCount(len(self.keys))
+        for row, key in enumerate(self.keys):
+            n = [c[key] for c in self.counts]
+            color, tip = None, ''
+            if len(n) == 2 and n[0] and not n[1]:
+                color, tip = self.DROPPED, 'In the input only: removed or replaced'
+            elif len(n) == 2 and n[1] and not n[0]:
+                color, tip = self.ADDED, 'In the output only: added by the converter'
+            cells = [code_label(*key)] + [str(x) if x else '' for x in n]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if col:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setToolTip(tip)
+                else:
+                    item.setToolTip(f'{cells[0]}: {code_description(*key)}')
+                if color is not None:
+                    item.setForeground(color)
+                self.table.setItem(row, col, item)
+
+    def _on_click(self, row: int, col: int) -> None:
+        key = self.keys[row]
+        if col == 0:
+            # The code itself: the output if it is there, else the input.
+            col = next((i + 1 for i in reversed(range(len(self.sides)))
+                        if self.counts[i][key]), 1)
+        side = col - 1
+        if not self.counts[side][key]:
+            return
+        _name, _editor, bar = self.sides[side]
+        bar.find(code_label(*key))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main Window
 # ─────────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
@@ -1528,8 +1737,14 @@ class MainWindow(QMainWindow):
         self.log_edit = self._make_editor(readonly=True)
         vsplit = QSplitter(Qt.Orientation.Vertical)
         vsplit.addWidget(split)
-        vsplit.addWidget(self._panel('Messages', self.log_edit))
-        vsplit.setSizes([620, 180])
+        self.codes = CodesPanel([('Input', self.input_edit, self.input_find),
+                                 ('Output', self.output_edit, self.output_find)])
+        bottom = QSplitter(Qt.Orientation.Horizontal)
+        bottom.addWidget(self._panel('Messages', self.log_edit))
+        bottom.addWidget(self.codes)
+        bottom.setSizes([1040, 300])
+        vsplit.addWidget(bottom)
+        vsplit.setSizes([580, 220])
         vlay.addWidget(vsplit, stretch=1)
 
         # ── Status bar ────────────────────────────────────────────────────

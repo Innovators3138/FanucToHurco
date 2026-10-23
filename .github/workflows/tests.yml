@@ -2,6 +2,7 @@ name: Tests
 
 on:
   push:
+    branches: [main]       # branches are covered by their pull request
   pull_request:
   workflow_dispatch:
 
