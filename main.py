@@ -59,9 +59,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QSplitter,
     QStatusBar, QFileDialog, QLabel, QDialog, QMessageBox, QSizePolicy,
+    QLineEdit,
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont, QAction
+from PyQt6.QtCore import Qt, QEvent, QTimer
+from PyQt6.QtGui import QFont, QAction, QColor, QKeySequence, QShortcut, QTextCursor
 
 import dncui
 import machines as mach
@@ -1285,6 +1286,180 @@ QProgressBar::chunk { background: #2d5a8e; }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Find bar
+# ─────────────────────────────────────────────────────────────────────────────
+CODE_QUERY = re.compile(r'\s*([A-Za-z])\s*([-+]?(?:\d+\.?\d*|\.\d+))\s*$')
+COMMENT = re.compile(r'\([^)\n]*\)?|;[^\n]*')
+
+
+def find_spans(text: str, query: str) -> Tuple[List[Tuple[int, int]], bool]:
+    """
+    (start, end) of every match of `query` in `text`, and whether it was
+    searched as a code word.
+
+    A query that is one letter plus a number is a code word: it is matched by
+    value through the WORD tokenizer, outside comments, so G1 finds G01 and G1.
+    but not G10 or G17, even in spaceless output like N30G1X0.  Anything else
+    is a case-insensitive text search.
+    """
+    if not query.strip():
+        return [], False
+    code = CODE_QUERY.match(query)
+    if code:
+        letter, value = code.group(1).upper(), float(code.group(2))
+        # One character in, one character out, so offsets still line up.
+        upper = text.encode('ascii', 'replace').decode('ascii').upper()
+        masked = COMMENT.sub(lambda c: ' ' * len(c.group()), upper)
+        return [(w.start(), w.end()) for w in WORD.finditer(masked)
+                if w.group(1) == letter and abs(float(w.group(2)) - value) < EPS
+                ], True
+    hay, needle = text.lower(), query.lower()
+    spans, at = [], hay.find(needle)
+    while at >= 0:
+        spans.append((at, at + len(needle)))
+        at = hay.find(needle, at + len(needle))
+    return spans, False
+
+
+class FindBar(QWidget):
+    """Ctrl+F search strip that sits under one editor."""
+
+    MAX_MARKS = 5000     # highlighting more than this makes typing sluggish
+
+    def __init__(self, editor: QTextEdit, parent=None) -> None:
+        super().__init__(parent)
+        self.editor = editor
+        self.spans: List[Tuple[int, int]] = []
+        self.current = -1
+        self.is_code = False
+
+        self.field = QLineEdit()
+        self.field.setPlaceholderText('Find  —  G1 finds G01 and G1., not G10')
+        self.field.installEventFilter(self)
+        self.count = QLabel()
+        self.count.setMinimumWidth(110)
+        prev_btn, next_btn, close_btn = (QPushButton(t) for t in ('▲', '▼', '✕'))
+        for btn, tip in ((prev_btn, 'Previous (Shift+Enter)'),
+                         (next_btn, 'Next (Enter)'), (close_btn, 'Close (Esc)')):
+            btn.setToolTip(tip)
+            btn.setStyleSheet('padding: 2px 8px; min-height: 20px;')
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 0)
+        lay.setSpacing(4)
+        lay.addWidget(self.field, stretch=1)
+        lay.addWidget(self.count)
+        for btn in (prev_btn, next_btn, close_btn):
+            lay.addWidget(btn)
+
+        self.field.textChanged.connect(lambda _t: self._search(move=True))
+        prev_btn.clicked.connect(lambda: self.step(-1))
+        next_btn.clicked.connect(lambda: self.step(+1))
+        close_btn.clicked.connect(self.close_bar)
+
+        # Re-highlight after the text changes (Convert, Load, typing), but
+        # without moving the cursor out from under someone typing.
+        self._refresh = QTimer(self)
+        self._refresh.setSingleShot(True)
+        self._refresh.setInterval(200)
+        self._refresh.timeout.connect(lambda: self._search(move=False))
+        editor.textChanged.connect(
+            lambda: self.isVisible() and self._refresh.start())
+        self.hide()
+
+    def open(self) -> None:
+        picked = self.editor.textCursor().selectedText()
+        if picked and ' ' not in picked:      # a selection within one line
+            self.field.blockSignals(True)
+            self.field.setText(picked)
+            self.field.blockSignals(False)
+        self.show()
+        self.field.setFocus()
+        self.field.selectAll()
+        self._search(move=True)
+
+    def close_bar(self) -> None:
+        self.hide()
+        self.editor.setExtraSelections([])
+        self.editor.setFocus()
+
+    def step(self, delta: int) -> None:
+        if not self.isVisible():
+            self.open()
+            return
+        if not self.spans:
+            return
+        n = len(self.spans)
+        cur = self.editor.textCursor()
+        if (cur.selectionStart(), cur.selectionEnd()) == self.spans[self.current]:
+            self.current = (self.current + delta) % n
+        else:
+            # The cursor was moved since the last match: go on from there.
+            here = cur.selectionStart()
+            if delta > 0:
+                self.current = next((i for i, (s, _e) in enumerate(self.spans)
+                                     if s >= here), 0)
+            else:
+                self.current = next((i for i in range(n - 1, -1, -1)
+                                     if self.spans[i][0] < here), n - 1)
+        self._show(move=True)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.field and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                self.step(-1 if shift else +1)
+                return True
+            if key == Qt.Key.Key_Escape:
+                self.close_bar()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _search(self, move: bool) -> None:
+        self.spans, self.is_code = find_spans(self.editor.toPlainText(),
+                                              self.field.text())
+        # Start from the cursor, so typing more of a query stays on the match
+        # already found.
+        here = self.editor.textCursor().selectionStart()
+        self.current = next((i for i, (s, _e) in enumerate(self.spans)
+                             if s >= here), 0) if self.spans else -1
+        self._show(move)
+
+    def _show(self, move: bool) -> None:
+        n = len(self.spans)
+        lo = max(0, min(self.current - self.MAX_MARKS // 2, n - self.MAX_MARKS))
+        marks = []
+        for i in range(lo, min(n, lo + self.MAX_MARKS)):
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = self._cursor(*self.spans[i])
+            if i == self.current:
+                sel.format.setBackground(QColor('#c08a1e'))
+                sel.format.setForeground(QColor('#000000'))
+            else:
+                sel.format.setBackground(QColor('#5a4a1c'))
+            marks.append(sel)
+        self.editor.setExtraSelections(marks)
+
+        if move and n:
+            self.editor.setTextCursor(self._cursor(*self.spans[self.current]))
+            self.editor.ensureCursorVisible()
+        kind = '  ·  code' if self.is_code else ''
+        if n:
+            self.count.setText(f'{self.current + 1} of {n}{kind}')
+        else:
+            self.count.setText('No matches' if self.field.text().strip() else '')
+        none = bool(self.field.text().strip()) and not n
+        self.field.setStyleSheet('border: 1px solid #b04040;' if none else '')
+
+    def _cursor(self, start: int, end: int) -> QTextCursor:
+        cur = QTextCursor(self.editor.document())
+        cur.setPosition(start)
+        cur.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        return cur
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main Window
 # ─────────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
@@ -1328,10 +1503,14 @@ class MainWindow(QMainWindow):
         self.input_edit = self._make_editor(
             placeholder='Paste or load Fanuc G-code here…'
         )
-        split.addWidget(self._panel('Input  (Fanuc G-Code)', self.input_edit))
+        self.input_find = FindBar(self.input_edit)
+        split.addWidget(self._find_panel('Input  (Fanuc G-Code)',
+                                         self.input_edit, self.input_find))
 
         self.output_edit = self._make_editor()
-        split.addWidget(self._panel('Output  (Hurco BNC)', self.output_edit))
+        self.output_find = FindBar(self.output_edit)
+        split.addWidget(self._find_panel('Output  (Hurco BNC)',
+                                         self.output_edit, self.output_find))
 
         self.canvas = PlotCanvas()
         nav_toolbar = NavigationToolbar(self.canvas, self)
@@ -1460,6 +1639,21 @@ class MainWindow(QMainWindow):
         lay.setSpacing(2)
         lay.addWidget(QLabel(title))
         lay.addWidget(widget)
+        return w
+
+    def _find_panel(self, title: str, editor: QTextEdit, bar: FindBar) -> QWidget:
+        """An editor panel whose Ctrl+F / F3 / Esc act on its own find bar."""
+        w = self._panel(title, editor)
+        w.layout().addWidget(bar)
+        for keys, slot in ((QKeySequence.StandardKey.Find, bar.open),
+                           (QKeySequence.StandardKey.FindNext, lambda: bar.step(+1)),
+                           (QKeySequence.StandardKey.FindPrevious, lambda: bar.step(-1))):
+            sc = QShortcut(QKeySequence(keys), w)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(slot)
+        esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), editor)
+        esc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        esc.activated.connect(lambda: bar.isVisible() and bar.close_bar())
         return w
 
     def _msg(self, text: str) -> None:

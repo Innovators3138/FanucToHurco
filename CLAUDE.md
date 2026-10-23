@@ -66,7 +66,7 @@ PyInstaller follows the imports from `main.py`, so the build needs no changes fo
 2. **`Converter`** — the Fanuc→BNC state machine. `convert(text)` feeds each source line to `Converter.process()` and returns `(output_text, warnings)`, where warnings is an `OrderedDict` of `{message: [source line numbers]}`.
 3. **`check(text)`** — an *independent* re-reader of BNC output returning `(problems, stats)`. It deliberately shares no code with the converter beyond the settings constants, so it catches converter bugs rather than confirming them.
 4. **`BackplotParser`** / **`PlotCanvas`** — re-parse the converted output into `rapid` / `feed` / `plunge` segment lists and draw them on embedded 3D Matplotlib axes.
-5. **`MainWindow`** — Load / Convert / Verify / Save / Clear, over a three-pane splitter (input, output, backplot) with a Messages pane beneath.
+5. **`MainWindow`** — Load / Convert / Verify / Save / Clear, over a three-pane splitter (input, output, backplot) with a Messages pane beneath. The input and output editors each have a `FindBar` (Ctrl+F, Enter/F3, Shift+Enter/Shift+F3, Esc). Its matching is `find_spans()`, which is headless-testable: a query that is one letter plus a number is matched by value through `WORD` outside comments (`G1` finds `G01`/`G1.` but not `G10`); anything else is a case-insensitive text search.
 
 ### Invariants worth knowing before editing
 
@@ -113,6 +113,8 @@ The drip-feed boxes speak a protocol reverse-engineered from QS Explorer 4.06. I
 - **One client at a time.** Opcode `0x63` means another PC holds the device; it is raised as `DncBusy` from any call. `MainWindow._open_browser` keeps one browser per IP for the same reason.
 - **Downloads need the file size up front.** There is no EOF marker, so the block count comes from the directory listing — `download_path()` does the lookup, `download()` takes the size.
 - **`0x12 WaitACK` can precede any filesystem ACK.** `_command()` keeps waiting after one *without resending*, since re-sending a delete or rename could run it twice.
+- **ReadDir is index-addressed, not a cursor.** Each entry carries the index to request next; sending 0 every time returns the first entry forever.
+- **`0x1B` with the text "Micro DNC is being busy." is a refusal, not a push.** `_is_busy()` tells it apart by the text alone; `_command()` resends after `BUSY_PAUSE` for up to `BUSY_WAIT`, without spending a timeout retry, and it is never recorded as a notice. It is usually brief, but the device says busy to every filesystem command for as long as its own file explorer menu is open, while info and status keep answering.
 - **The device pushes unsolicited packets** (`0x1B` entered-DNC-mode, `0x18` startup-copy) that can land mid-exchange. Every wait loop steps over them and records them in `QSClient.notices`; the browser shows them in its message line.
 - Strings are one byte per character, so **filenames must stay ASCII**. Paths use `\`, have no drive letter, and the root is the empty string — the `0:` in the UI is display only.
 

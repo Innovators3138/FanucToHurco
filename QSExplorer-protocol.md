@@ -130,7 +130,7 @@ Responses shorter than 5 bytes are treated as malformed.
 | `0x16` | SendDeviceMsgACK | — |
 | `0x18` | StartUpCopyFileACK | if length ≠ 5: string from offset 6 (device-initiated) |
 | `0x1A` | StartRunFileACK | — |
-| `0x1B` | DeviceDNCMode | string from offset 6 — device has entered DNC mode |
+| `0x1B` | DeviceDNCMode | string from offset 6 — device has entered DNC mode. **Also** sent as a reply meaning "not now" with the text `Micro DNC is being busy.` (see §6) |
 | `0x1D` | DeviceDNCStopACK | — |
 | `0x33` | ReadStatusAck | status record, see §4.5 |
 | `0x35` | CloseFileAck | — |
@@ -150,11 +150,17 @@ The root is the empty string. The `0:` you see in the GUI is display-only.
 ```
 → 00 1B  "<path>" 00                 OpenDir
 ← 00 07  <FR code>                   OpenDirAck   (FR != 0 → error, stop)
+index = 0
 repeat:
-  → 00 08  <u16 0> "<path>" 00       ReadDir  (index field is always 0; the device
-  ← 00 09  <FR> <entry...>             keeps the cursor)
+  → 00 08  <u16 index> "<path>" 00   ReadDir
+  ← 00 09  <FR> <entry...>
+  index = entry index
 until entry index == 0xFFFF
 ```
+
+The device keeps **no cursor**: ReadDir with index *n* returns entry *n*, and the
+entry's index field is the index to request next. Sending 0 every time returns the
+first entry forever (verified against a real device, 2026-10-22).
 
 ### 4.2 ReadDirData entry layout
 
@@ -162,7 +168,7 @@ until entry index == 0xFFFF
 off 0 : 00 09
 off 2 : u32 FR code   (non-zero → no entry, error)
 off 6 : name bytes ... 00
-      : u16 entry index (BE)   0xFFFF = end of listing
+      : u16 next index (BE)    0xFFFF = end of listing
       : u8  attributes
       : u32 file size (BE)
 ```
@@ -275,3 +281,13 @@ SD card, with this protocol as a thin RPC over its `f_opendir` / `f_readdir` / `
 6. There is no length or checksum field. Trust the UDP checksum and the 800 ms timeout.
 7. The device pushes unsolicited `0x1B` (entered DNC mode) and `0x18` packets — a robust
    client should tolerate them arriving mid-exchange.
+8. A `0x1B` whose text is `Micro DNC is being busy.` is **not** a push: it is the
+   device refusing the command it just received. Only the text distinguishes it from
+   the DNC-mode push. Two cases seen on a real device:
+   * **Brief:** in reply to OpenDir sent ~5 ms after a ReadStatus; cleared within about
+     a second. Resending after a short pause beats waiting out the 800 ms timeout.
+   * **Indefinite:** while the device's own file explorer menu is open on its screen,
+     it refuses all filesystem commands for as long as the menu stays open. GetDeviceInfo
+     and ReadStatus still answer. ReadStatus then reports the folder being browsed as the
+     current file (e.g. `0:/DNC2 used manual`). No resending helps: someone has to
+     leave that menu on the device.

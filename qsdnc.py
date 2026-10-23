@@ -21,6 +21,7 @@ import math
 import socket
 import struct
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -33,6 +34,8 @@ LONG_CMD_RETRIES = 10    # WRQ / CloseFile in the copy task
 DATA_RETRIES = 10        # DATA_RESEND_MAX
 BLOCK = 512
 BIND_RETRIES = 5
+BUSY_PAUSE = 0.1         # wait before resending after a "being busy" reply
+BUSY_WAIT = 5.0          # how long the device may keep saying busy
 
 # ───────────────────────────── client → device ──────────────────────────────
 OP_RRQ      = 0x01
@@ -314,7 +317,19 @@ class QSClient:
         finally:
             sock.settimeout(self.timeout)
 
+    @staticmethod
+    def _is_busy(raw: bytes) -> bool:
+        """
+        The device answers a command it cannot take yet with opcode 0x1B and
+        the text "Micro DNC is being busy." — the same opcode as the
+        entered-DNC-mode push, so only the text tells them apart.
+        """
+        return (len(raw) >= 2 and raw[1] == R_DNCMODE
+                and b'busy' in raw[6:].split(b'\x00')[0].lower())
+
     def _note(self, raw: bytes) -> None:
+        if self._is_busy(raw):
+            return             # a refusal, not news; _command resends on it
         text = raw[6:].split(b'\x00')[0].decode('latin-1', 'replace').strip()
         label = 'entered DNC mode' if raw[1] == R_DNCMODE else 'startup copy'
         self.notices.append(f'{label}: {text}' if text else label)
@@ -327,7 +342,9 @@ class QSClient:
         if drain:
             self._drain()
         saw_wait = False
-        for _attempt in range(retries + 1):
+        busy_until: Optional[float] = None
+        attempts = 0
+        while attempts <= retries:
             self._abort_check()
             if not saw_wait:
                 # After a WaitACK the device is already working on it; resending
@@ -344,6 +361,8 @@ class QSClient:
                         msg = raw[4:].split(b'\x00')[0].decode('latin-1', 'replace')
                         raise DncRemoteError(f'device error {code}: {msg}'
                                              if msg else f'device error {code}')
+                    if self._is_busy(raw) and not saw_wait:
+                        break             # refused, not started: resend below
                     if rop in UNSOLICITED:
                         self._note(raw)
                         continue
@@ -355,7 +374,16 @@ class QSClient:
                     # Anything else is a straggler from an earlier exchange.
                     continue
             except socket.timeout:
+                attempts += 1
                 continue
+            # The device said busy.  Resending is what it is asking for, so it
+            # does not use up a timeout retry, but give up if it never clears.
+            now = time.monotonic()
+            if busy_until is None:
+                busy_until = now + BUSY_WAIT
+            elif now > busy_until:
+                raise DncTimeout(f'{self.ip} stayed busy for {BUSY_WAIT:.0f} s')
+            time.sleep(BUSY_PAUSE)
         raise DncTimeout(f'no response to opcode 0x{op:02X} from {self.ip}')
 
     def _abort_check(self) -> None:
@@ -399,29 +427,33 @@ class QSClient:
         self._check_fr(code, f'open {path or chr(92)}')
 
         entries: List[Entry] = []
-        # The device keeps the cursor; the index field in the request is always 0.
-        request = b'\x00\x00' + _z(path)
+        # The device keeps no cursor: ReadDir index n returns entry n plus the
+        # index to ask for next.  Sending 0 every time returns the first entry
+        # forever.
+        index = 0
         while True:
-            _op, code, body, _raw = self._command(OP_READDIR, request,
-                                                  (R_READDIR,))
+            _op, code, body, _raw = self._command(
+                OP_READDIR, index.to_bytes(2, 'big') + _z(path), (R_READDIR,))
             if code != FR_OK:
                 if code == FR_NO_FILE:
                     break          # nothing more to list
                 raise FatFsError(code, f'read {path or chr(92)}')
-            entry = self._parse_entry(body)
-            if entry is None:
+            parsed = self._parse_entry(body)
+            if parsed is None:
                 break              # index 0xFFFF terminates the listing
+            next_index, entry = parsed
             if entry.name not in ('.', '..'):
                 entries.append(entry)
-            if len(entries) > 10000:
-                raise DncError('directory listing did not terminate')
+            if next_index <= index:
+                raise DncError('directory listing did not advance')
+            index = next_index
         entries.sort(key=lambda e: (not e.is_dir, e.name.upper()))
         return entries
 
     @staticmethod
-    def _parse_entry(body: bytes) -> Optional[Entry]:
+    def _parse_entry(body: bytes) -> Optional[Tuple[int, Entry]]:
         """
-        name\0 | u16 index | u8 attributes | u32 size
+        name\0 | u16 next index | u8 attributes | u32 size
         Index 0xFFFF marks the end of the listing.
         """
         cut = body.find(b'\x00')
@@ -434,7 +466,7 @@ class QSClient:
         if index == 0xFFFF:
             return None
         name = body[:cut].decode('latin-1', 'replace')
-        return Entry(name, int.from_bytes(tail[3:7], 'big'), tail[2])
+        return index, Entry(name, int.from_bytes(tail[3:7], 'big'), tail[2])
 
     # ── mutating filesystem operations ───────────────────────────────────────
     def mkdir(self, path: str) -> None:
