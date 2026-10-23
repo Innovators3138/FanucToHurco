@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install PyQt6 matplotlib pyinstaller
+          pip install -r requirements.txt pyinstaller
 
       - name: Build EXE
         run: |
