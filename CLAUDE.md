@@ -9,8 +9,9 @@ Desktop GUI (PyQt6 + Matplotlib) that converts Onshape/Fanuc G-code into the Hur
 ## Commands
 
 ```bash
-pip install PyQt6 matplotlib          # runtime deps (no requirements.txt)
+pip install -r requirements-dev.txt   # pinned runtime deps + pytest
 python3 main.py                       # run the GUI
+python3 -m pytest                     # the test suite, ~15 s, no display needed
 
 # Build (macOS .app / local one-file)
 pyinstaller FanucToHurco.spec
@@ -21,9 +22,18 @@ pyinstaller --onefile --windowed --name FanucToHurco \
     main.py
 ```
 
-Pushing to `main` triggers [.github/workflows/build-windows.yml](.github/workflows/build-windows.yml), which builds `dist/FanucToHurco.exe` on `windows-latest` and uploads it as an artifact.
+Pushing to `main` triggers [.github/workflows/build-windows.yml](.github/workflows/build-windows.yml), which builds `dist/FanucToHurco.exe` on `windows-latest` and uploads it as an artifact. Every push and pull request runs the tests in [.github/workflows/tests.yml](.github/workflows/tests.yml), on the same Python (3.12) as the build.
 
-There is no test suite. `main.py` exposes three import-friendly entry points, so a conversion change can be exercised headlessly:
+### Tests
+
+[tests/](tests/) is pytest, one file per module (`test_converter`, `test_check`, `test_backplot`, `test_find`, `test_qsdnc`, `test_dncui`, `test_machines`). `conftest.py` sets `QT_QPA_PLATFORM=offscreen` before anything imports Qt.
+
+- **Converter tests use `check()` as the oracle**: the `run()` helper fails any test whose output `check()` objects to, so every conversion test is also a format test. `test_check.py` goes the other way, breaking known-good output one way at a time to prove `check()` notices.
+- **[tests/fake_device.py](tests/fake_device.py) is a Micro DNC on loopback UDP**, with an in-memory filesystem that behaves like the real box (index-addressed ReadDir, case-insensitive names, FR codes). Its knobs (`busy`, `wait_ack`, `drop`, `push`, `error`, `owned`, `silent`) reproduce the awkward behaviours; `received` logs every packet for asserting how many times something was sent. When the real device surprises you, teach the fake first and write the failing test.
+- **GUI tests must not meet a modal dialog.** Offscreen, a `QMessageBox` waits forever for a click, so the whole run hangs rather than fails. `test_dncui.py`'s `popups` fixture replaces the static `QMessageBox` calls and records them; anything new that can pop a dialog needs the same treatment. CI has a 10-minute timeout as the backstop.
+- `dnc_selftest.py` is the hardware counterpart: run it against a real device after protocol changes.
+
+`main.py` also exposes three import-friendly entry points, so a conversion change can be exercised headlessly from a REPL:
 
 ```python
 import main as m
@@ -43,7 +53,9 @@ python3 qsdnc.py 192.168.1.50 put out.nc "\\PROGRAMS\\PART1.NC"
 python3 qsdnc.py 192.168.1.50 run "\\PROGRAMS\\PART1.NC"
 ```
 
-To test protocol changes without hardware, stand up a UDP socket that answers the opcodes in §3 of the protocol spec; `qsdnc.QSClient(ip, port=…, bind_port=0)` will talk to it on loopback. `qsdnc.PORT` and `qsdnc.BIND_PORT` are read at connect time by `dncui.ClientThread`, so patching them redirects the whole GUI at a fake device.
+In PowerShell, write device paths in single quotes with single backslashes (`'\program\PART1.NC'`): PowerShell does not treat `\` as an escape, so `"\\PROGRAMS"` arrives with two. Windows PowerShell 5.1 also drops an empty-string argument, so list the root by leaving the path off.
+
+`qsdnc.QSClient(ip, port=…, bind_port=0)` talks to the fake device on loopback. `qsdnc.PORT` and `qsdnc.BIND_PORT` are read at connect time by `dncui.ClientThread`, so patching them redirects the whole GUI at it, as `test_dncui.py` does.
 
 ## Architecture
 
