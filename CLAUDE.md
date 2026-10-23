@@ -14,6 +14,7 @@ python3 main.py                       # run the GUI
 python3 -m pytest                     # the test suite, ~15 s, no display needed
 
 # Build (macOS .app / local one-file)
+pip install -r requirements-build.txt # pinned runtime deps + PyInstaller
 pyinstaller FanucToHurco.spec
 # or from scratch, matching the CI invocation:
 pyinstaller --onefile --windowed --name FanucToHurco \
@@ -22,11 +23,20 @@ pyinstaller --onefile --windowed --name FanucToHurco \
     main.py
 ```
 
-Pushing to `main` triggers [.github/workflows/build-windows.yml](.github/workflows/build-windows.yml), which builds `dist/FanucToHurco.exe` on `windows-latest` and uploads it as an artifact. Every pull request, and every push to `main`, runs the tests in [.github/workflows/tests.yml](.github/workflows/tests.yml), on the same Python (3.12) as the build.
+Pushing to `main` triggers [.github/workflows/build-windows.yml](.github/workflows/build-windows.yml), which builds `dist/FanucToHurco.exe` on `windows-latest` and uploads it as a 30-day artifact.
+
+### Releases
+
+Pushing a tag `vX.Y` runs [.github/workflows/release.yml](.github/workflows/release.yml): tests, build, a start-up check of the exe, then a GitHub Release with `FanucToHurco-vX.Y.exe` attached and notes generated from the merged PRs since the previous release. A pull request that touches the release workflow, `version.py` or a `requirements*.txt` runs the same build and check without publishing.
+
+- **The version lives in [version.py](version.py)**, committed as `VERSION = 'dev'`. The build workflows append a second `VERSION = '...'` line before PyInstaller runs (the later assignment wins): the tag for a release, `git describe --match "v[0-9]*"` for a main build (`v1.0-3-gabc1234`). A run from source shows `dev (<describe>)`. The window title shows `app_version()`.
+- **Only `v[0-9]*` tags count.** An older tag named `Release` (GitHub release v0.1, April 2026) predates this scheme; without `--match`, `git describe` names builds after it.
+- **The start-up check** runs the built exe with `QT_QPA_PLATFORM=offscreen` and `FANUCTOHURCO_SMOKE_TEST=1`, which makes `main()` quit a second after the window is built. A non-zero exit fails the build. It catches what PyInstaller left out, which the tests (running from source) cannot.
+- A one-file exe runs the app in a child process of the bootloader: stopping the parent does not stop the app, and the window title belongs to the child. Every pull request, and every push to `main`, runs the tests in [.github/workflows/tests.yml](.github/workflows/tests.yml), on the same Python (3.12) as the build.
 
 ### Tests
 
-[tests/](tests/) is pytest, one file per module (`test_converter`, `test_check`, `test_backplot`, `test_find`, `test_codes`, `test_qsdnc`, `test_dncui`, `test_machines`). `conftest.py` sets `QT_QPA_PLATFORM=offscreen` before anything imports Qt.
+[tests/](tests/) is pytest, one file per module (`test_converter`, `test_check`, `test_backplot`, `test_find`, `test_codes`, `test_qsdnc`, `test_dncui`, `test_machines`, `test_version`). `conftest.py` sets `QT_QPA_PLATFORM=offscreen` before anything imports Qt.
 
 - **Converter tests use `check()` as the oracle**: the `run()` helper fails any test whose output `check()` objects to, so every conversion test is also a format test. `test_check.py` goes the other way, breaking known-good output one way at a time to prove `check()` notices.
 - **[tests/fake_device.py](tests/fake_device.py) is a Micro DNC on loopback UDP**, with an in-memory filesystem that behaves like the real box (index-addressed ReadDir, case-insensitive names, FR codes). Its knobs (`busy`, `wait_ack`, `drop`, `push`, `error`, `owned`, `silent`) reproduce the awkward behaviours; `received` logs every packet for asserting how many times something was sent. When the real device surprises you, teach the fake first and write the failing test.
