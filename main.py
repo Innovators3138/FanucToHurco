@@ -38,6 +38,7 @@ PyInstaller (single-file, no console window):
 """
 
 import math
+import os
 import re
 import sys
 from collections import Counter, OrderedDict
@@ -66,6 +67,7 @@ from PyQt6.QtGui import QFont, QAction, QColor, QKeySequence, QShortcut, QTextCu
 
 import dncui
 import machines as mach
+from version import app_version
 
 
 # ═════════════════════════ MACHINE SETTINGS ═════════════════════════════════
@@ -1674,7 +1676,8 @@ class CodesPanel(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle('FanucToHurco  —  Hurco BNC Converter + 3D Backplot')
+        self.setWindowTitle(f'FanucToHurco {app_version()}  —  '
+                            'Hurco BNC Converter + 3D Backplot')
         self.resize(1440, 900)
         self.setStyleSheet(_DARK_STYLE)
 
@@ -2003,6 +2006,10 @@ def main() -> None:
     app.setStyleSheet(_DARK_STYLE)   # on the app, so dialogs are styled too
     win = MainWindow()
     win.show()
+    if os.environ.get('FANUCTOHURCO_SMOKE_TEST'):
+        # The release build starts the exe this way: getting this far proves
+        # PyInstaller bundled everything the window needs.
+        QTimer.singleShot(1000, app.quit)
     sys.exit(app.exec())
 
 

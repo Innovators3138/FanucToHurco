@@ -1,0 +1,84 @@
+name: Release
+
+# Push a tag like v1.0 to publish a GitHub Release with the exe attached.
+# A pull request that touches the release machinery builds and smoke-tests
+# the exe the same way but publishes nothing.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - version.py
+      - requirements*.txt
+
+permissions:
+  contents: write          # creating the release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # tags and history, for git describe
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-build.txt pytest
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pytest -q
+
+      - name: Stamp version
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') { $v = $env:GITHUB_REF_NAME }
+          else { $v = git describe --tags --match "v[0-9]*" --always }
+          "VERSION = '$v'" | Out-File -Encoding ascii -Append version.py
+          "APP_VERSION=$v" | Out-File -Encoding ascii -Append $env:GITHUB_ENV
+          Write-Output "Building $v"
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --windowed --name FanucToHurco `
+            --hidden-import mpl_toolkits.mplot3d `
+            --hidden-import matplotlib.backends.backend_qtagg `
+            main.py
+          Rename-Item dist/FanucToHurco.exe "FanucToHurco-$env:APP_VERSION.exe"
+
+      - name: Check the EXE starts
+        env:
+          QT_QPA_PLATFORM: offscreen
+          FANUCTOHURCO_SMOKE_TEST: "1"
+        run: |
+          $p = Start-Process "dist/FanucToHurco-$env:APP_VERSION.exe" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "exe exited with $($p.ExitCode)" }
+          Write-Output "exe started and exited cleanly"
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FanucToHurco-${{ env.APP_VERSION }}
+          path: dist/FanucToHurco-${{ env.APP_VERSION }}.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:APP_VERSION "dist/FanucToHurco-$env:APP_VERSION.exe" `
+            --title "FanucToHurco $env:APP_VERSION" `
+            --notes "Download **FanucToHurco-$env:APP_VERSION.exe** below and run it; no install needed. The title bar shows the version." `
+            --generate-notes

@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # tags and history, for git describe
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -20,7 +22,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements-build.txt
+
+      - name: Stamp version
+        run: |
+          $v = git describe --tags --match "v[0-9]*" --always
+          "VERSION = '$v'" | Out-File -Encoding ascii -Append version.py
+          Write-Output "Building $v"
 
       - name: Build EXE
         run: |
@@ -28,6 +36,14 @@ jobs:
             --hidden-import mpl_toolkits.mplot3d `
             --hidden-import matplotlib.backends.backend_qtagg `
             main.py
+
+      - name: Check the EXE starts
+        env:
+          QT_QPA_PLATFORM: offscreen
+          FANUCTOHURCO_SMOKE_TEST: "1"
+        run: |
+          $p = Start-Process dist/FanucToHurco.exe -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "exe exited with $($p.ExitCode)" }
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
