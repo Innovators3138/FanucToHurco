@@ -37,7 +37,7 @@ def test_every_code_the_bx_mpu_takes_is_described():
 
 
 def test_every_fanuc_code_the_converter_handles_is_described():
-    handled = ({20, 21, 28, 30, 53, 43, 49, 54, 94, 95, 98, 99, 90.1, 91.1,
+    handled = ({20, 21, 28, 30, 53, 43, 49, 54, 94, 95, 98, 99, 90.1, 91.1, 9, 61, 64,
                 10, 65, 18, 19} | set(m.CYCLE_MAP))
     for g in handled:
         assert ('G', g) in m.BX_CODES or ('G', g) in m.FANUC_CODES, f'G{g}'
@@ -45,7 +45,7 @@ def test_every_fanuc_code_the_converter_handles_is_described():
 
 
 @pytest.mark.parametrize('key, text', [
-    (('G', 81), 'Drill cycle'),
+    (('G', 81), 'Drill cycle: feed to depth, rapid out'),
     (('M', 25), 'Z retract to machine home'),
     (('G', 43), 'Tool length compensation + (Fanuc only; the BX-MPU does not use it)'),
     (('G', 70), 'Hurco BX: English (inch) units\nFanuc: Lathe finishing cycle; not used on a mill'),
@@ -98,7 +98,7 @@ def test_dropped_and_added_codes_are_coloured(window):
 def test_code_cell_describes_the_code_count_cells_keep_their_tip(window):
     t, panel = window.codes.table, window.codes
     r = row_of(panel, 'G81')
-    assert t.item(r, 0).toolTip() == 'G81: Drill cycle'
+    assert t.item(r, 0).toolTip() == 'G81: Drill cycle: feed to depth, rapid out'
     assert t.item(r, 1).toolTip() == 'In the input only: removed or replaced'
     assert t.item(row_of(panel, 'M25'), 2).toolTip() == \
         'In the output only: added by the converter'

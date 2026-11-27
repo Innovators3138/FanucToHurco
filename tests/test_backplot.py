@@ -46,8 +46,29 @@ def test_expanded_drilling_is_drawn_as_plunges():
 
 def test_native_drilling_is_drawn_as_plunges(monkeypatch):
     monkeypatch.setattr(m, 'CYCLE_MODE', 'native')
-    bp = parse('G0 X1 Y1 Z0.5\nG81 X1 Y1 Z-0.25 R0.1 F5\nX2\nG80\nM30')
+    bp = parse('G0 X1 Y1 Z0.5\nG99 G81 X1 Y1 Z-0.25 R0.1 F5\nX2\nG80\nM30')
     assert [s[:2] for s in bp.plunge] == [(1, 1), (2, 1)]
+    # the depth word is relative to the start Z (the R plane here)
+    assert all(s[2] == pytest.approx(0.1) and s[5] == pytest.approx(-0.25)
+               for s in bp.plunge)
+
+
+def test_cycle_depth_words_are_not_taken_for_m25_height(monkeypatch):
+    """G81 Z0.75 is a depth of 0.75, not a height above the part."""
+    monkeypatch.setattr(m, 'CYCLE_MODE', 'native')
+    out, _ = m.convert('G0 X1 Y1 Z0.5\nG81 X1 Y1 Z-0.25 R0.1 F5\nG80\nM30')
+    assert 'Z0.75' in out
+    assert m.BackplotParser._scan_z_home(out) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize('src, mid', [
+    ('G0 X0 Y0 Z0\nG0 X2 Y1 Z1\nM30', (0, 0, 1)),     # up: Z first
+    ('G0 X0 Y0 Z1\nG0 X2 Y1 Z0\nM30', (2, 1, 1)),     # down: XY first
+])
+def test_rapid_with_z_is_drawn_in_the_firmware_order(src, mid):
+    bp = parse(src)
+    i = [s[3:] for s in bp.rapid].index(mid)
+    assert bp.rapid[i + 1][:3] == mid
 
 
 def test_m25_retracts_to_highest_commanded_z():
