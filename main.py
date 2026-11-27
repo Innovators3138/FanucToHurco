@@ -5,7 +5,8 @@ Target hardware: AMTS BX-MPU retrofit on Hurco KMB-1 / MB-1
 
 Converts "Generic 3-axis Fanuc" G-code (e.g. from Onshape CAM Studio) into the
 legacy Hurco KMB-1 / AMTS BX-MPU NC format described in the AMTS G-code sheet
-(Gcodes.pdf), then backplots the converted program in 3D.
+(Gcodes.pdf), as corrected by the reverse-engineered firmware analysis
+("GCODES from Analysis.md"), then backplots the converted program in 3D.
 
 What the converter does
   * Arc centers (I/J) converted to ABSOLUTE coordinates, and every arc block
@@ -16,8 +17,10 @@ What the converter does
   * Incremental (G91) moves converted to absolute.
   * G28/G53 Z retracts -> M25.  XY home moves dropped.
   * Canned cycles expanded into plain moves (default, like the Fusion
-    hurcoBX.cps post) or rewritten using the Z-word templates below.
-  * Unsupported codes (G43 G49 G54 G94 G98 H D ...) removed and reported.
+    hurcoBX.cps post) or sent as native BX cycles, whose depth is measured
+    down from the Z the cycle starts at (the BX has no R plane).
+  * Dwells written as G04/t.  Feeds clamped to the BX's 250 ipm.
+  * Unsupported codes (G43 G49 G54 G61 G94 G98 H D ...) removed and reported.
   * Header/footer and N2, N4, ... numbering match the AMTS sample program.
 
 Output format (per AMTS BX-MPU spec / Gcodes.pdf sample):
@@ -71,9 +74,15 @@ from version import app_version
 
 
 # ═════════════════════════ MACHINE SETTINGS ═════════════════════════════════
-DEC = 4                 # decimals for X Y Z I J (inch)
-FEED_DEC = 1            # decimals for F
+# Limits and formats marked [fw] come from the reverse-engineered firmware
+# analysis of the 55-80B3 executive ("GCODES from Analysis.md"), which corrects
+# Gcodes.pdf where the two disagree.
+DEC = 4                 # decimals for X Y Z I J, inch [fw]
+DEC_METRIC = 3          # the same in mm [fw]
+FEED_DEC = 1            # decimals for F [fw]
 N_START, N_STEP = 2, 2
+N_MAX = 19999           # highest sequence number the control's help allows [fw];
+                        # longer programs start the numbering again at N_START
 HELIX_MAX_DEG = 90.0    # helical arcs are split into pieces no bigger than this
 ARC_MAX_DEG = 360.0     # flat arcs: AMTS sample shows full circles are accepted
 LINEARIZE_TOL = 0.0005  # chord error when converting G18/G19 arcs to lines
@@ -85,39 +94,56 @@ LINEARIZE_TOL = 0.0005  # chord error when converting G18/G19 arcs to lines
 #   None       -> no K (NOT recommended; Z motion goes wrong without it)
 HELIX_K = 'signed'
 
-# Canned cycles: which Z words follow "G8x X.. Y..".
-#   'R' = retract/rapid plane (absolute)   'Z' = final depth (absolute)
-#   'Q' = peck increment (positive number, times PECK_SIGN)
-# >>> CONFIRM ON THE MACHINE.  G83 taking three Z words is known; the ORDER
-# >>> below and the use of Z words for the other cycles are assumptions.
+# Native canned cycles [fw]: "G8x X.. Y.. Z(depth) [Z(first peck) [Z(peck)]] F.."
+#   depth  = total depth, unsigned, measured DOWN from the Z the tool is at
+#            when the cycle starts.  There is no R plane: every hole retracts
+#            to that start Z.
+#   peck1  = first peck (G83/G87 only; must be less than depth)
+#   peck   = later pecks (G83/G87 only)
+# The converter rapids to the Fanuc R plane before the cycle (G99), or starts
+# it from the initial Z (G98), so the start Z is the height the hole returns to.
 CYCLE_TEMPLATES = {
-    81: ['R', 'Z'],
-    82: ['R', 'Z'],
-    83: ['R', 'Z', 'Q'],
-    84: ['R', 'Z'],
-    85: ['R', 'Z'],
+    81: ['depth'],
+    82: ['depth'],
+    83: ['depth', 'peck1', 'peck'],
+    84: ['depth'],
+    85: ['depth'],
+    86: ['depth'],
+    87: ['depth', 'peck1', 'peck'],
+    89: ['depth'],
 }
-PECK_SIGN = +1
+CHIP_BREAK = 0.05       # G87 retract after each peck: 0.050 in / 1.27 mm [fw]
 
 # How canned cycles are sent.
 #   'expand' -> write drilling as plain G00/G01 moves (what the proven Fusion
 #               hurcoBX.cps post does; it never sends G81-G85 to the control)
 #   'native' -> send G8x blocks using CYCLE_TEMPLATES above
-# G84 tapping is always sent native (it cannot be safely expanded).
+# Always native: G84 tapping (cannot be expanded), and G82/G89 when they carry
+# a dwell, because the firmware only dwells inside those two cycles [fw].
 CYCLE_MODE = 'expand'
 PECK_CLEARANCE = 0.01   # expanded G83: rapid back down to this far above last peck
 
-KEEP_D_WORD = False     # hurcoBX.cps writes D on G41/G42; the AMTS sheet does not
-EMIT_G75 = False        # G75 is the power-up default per AMTS; not on its valid-code list
-MAX_TOOL = 24           # Hurco BX tool changer limit (hurcoBX.cps)
-RPM_RANGE = (60, 4000)  # Hurco BX spindle range (hurcoBX.cps)
+# Dwell: written "G04/t" [fw].  The control's two help texts disagree on the
+# unit ("/TIME .1SEC" vs "SECONDS x 100").  >>> CONFIRM ON THE MACHINE.
+DWELL_TICKS_PER_SEC = 10
+DWELL_MAX = 9999        # [fw] BAD DWELL TIME above this
+
+EMIT_G75 = False        # G75 is the power-up default [fw, init code at 0x23EC]
+MAX_TOOL = 12           # M06 accepts T1-T12 in this build [fw] (T words go to 24)
+RPM_RANGE = (40, 3680)  # what the firmware accepts [fw]; its help says 40-4000
+MAX_FEED = 250.0        # ipm [fw]; higher F is BAD FEED RATE, so it is clamped
+MAX_FEED_METRIC = 6350.0  # mm/min, the same limit
 
 # Fanuc cycles with no Hurco equivalent are mapped to the nearest one (warned)
-CYCLE_MAP = {73: 83, 74: 84, 76: 85, 86: 85, 87: 85, 88: 85, 89: 85}
+CYCLE_MAP = {73: 87, 74: 84, 76: 86, 87: 85, 88: 85}
 
-ALLOWED_G = {0, 1, 2, 3, 4, 9, 17, 40, 41, 42, 61, 64, 70, 71, 75,
-             80, 81, 82, 83, 84, 85, 90}
-ALLOWED_M = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 25}
+# What converted output may contain.  The firmware [fw] also takes G16, G18,
+# G19, G74, G91, G92 and G99, but the converter never needs them; G09, G61 and
+# G64 (on the AMTS sheet) are not in the firmware's G table at all.
+ALLOWED_G = {0, 1, 2, 3, 4, 17, 40, 41, 42, 70, 71, 75,
+             80, 81, 82, 83, 84, 85, 86, 87, 89, 90}
+ALLOWED_M = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 19, 20, 25}
+REJECTED_G = {9, 61, 64}    # Fanuc exact-stop codes the firmware rejects [fw]
 
 BUFFER_CHARS = 20000    # control's program buffer; above this it must drip-feed
 # ════════════════════════════════════════════════════════════════════════════
@@ -164,6 +190,8 @@ class Converter:
         self.cycle = None
         self.cycle_return = 'init'
         self.spindle_on = False
+        self.spindle_dir = 3          # M03 or M04, for restarting after G86
+        self.rpm_known = False        # M03/M04 with no S ever set is NO RPM
         self.coolant_on = False
         self.metric = metric
         self.ended = False
@@ -182,15 +210,29 @@ class Converter:
     def warn(self, msg):
         self.warnings.setdefault(msg, []).append(self.lineno)
 
+    def num(self, v):
+        """A coordinate: 4 decimals in inch, 3 in mm, as the firmware reads them."""
+        return fnum(v, DEC_METRIC if self.metric else DEC)
+
+    def unit(self, inches):
+        """A built-in inch distance in the program's units."""
+        return inches * 25.4 if self.metric else inches
+
     def emit(self, words):
         block = ''.join(words)
         if not block:
             return
         self.body.append(f"N{self.n}{block}")
         self.n += N_STEP
+        if self.n > N_MAX:
+            self.n = N_START
+            self.warn(f"program is longer than N{N_MAX}; numbering starts again at N{N_START}")
         self.last_block = block
 
     def emit_m25(self):
+        # M25 (and M06, which always comes with one) ends a canned cycle on
+        # the BX, and a cycle cannot start from the unknown Z it leaves.
+        self.cancel_cycle()
         if self.last_block != 'M25':
             self.emit(['M25'])
         self.pos['Z'] = None
@@ -206,9 +248,35 @@ class Converter:
             self.last_motion_out = code
 
     def feed_word(self, words):
-        if self.feed is not None and self.feed != self.last_feed_out:
+        """F for a G01/G02/G03 block.  The canned-cycle feed is a separate
+        register on the BX, so a cycle's F never counts as written here."""
+        if self.feed is None:
+            if self.last_feed_out is None:
+                self.warn("feed move with no F before it (the BX stops with NO FEED RATE)")
+            return
+        if self.feed != self.last_feed_out:
             words.append('F' + fnum(self.feed, FEED_DEC))
             self.last_feed_out = self.feed
+
+    def set_feed(self, f):
+        top = MAX_FEED_METRIC if self.metric else MAX_FEED
+        if f > top:
+            unit = 'mm/min' if self.metric else 'ipm'
+            self.warn(f"F{f:g} above the BX limit of {top:g} {unit}; clamped")
+            f = top
+        self.feed = f
+
+    def dwell_word(self, sec):
+        """'/t' dwell word, in control ticks, or None if there is no dwell."""
+        ticks = int(round(sec * DWELL_TICKS_PER_SEC))
+        if ticks > DWELL_MAX:
+            self.warn(f"dwell of {sec:g} s is above the BX limit; shortened")
+            ticks = DWELL_MAX
+        if ticks <= 0:
+            if sec > 0:
+                self.warn(f"dwell of {sec:g} s is shorter than the BX can time; dropped")
+            return None
+        return f"/{ticks}"
 
     # ----------------------------------------------------------------- input
     def process(self, lineno, raw):
@@ -274,20 +342,30 @@ class Converter:
                 self.ij_absolute_in = False
             elif gi in (40, 41, 42):
                 comp = f"G{gi}"
+                if gi != 40:
+                    self.warn("G41/G42 need a diameter stored for the tool on the BX "
+                              "(NO TOOL DIAMETER) - check the tool table")
             elif gi == 4:
                 sec = self.dwell_seconds(vals)
-                if sec is not None:
-                    self.emit(['G04', 'P' + fnum(sec, 3)])
+                word = self.dwell_word(sec) if sec is not None else None
+                if word:
+                    self.warn("G04 dwell on its own block: the BX firmware may only "
+                              "dwell inside G82/G89 - verify")
+                    self.emit(['G04', word])
                 return
-            elif gi in (9, 61, 64, 75):
+            elif gi in REJECTED_G:
+                self.warn(f"G{gi:02d} is not in the BX firmware (BAD G CODE); removed")
+            elif gi == 75:
                 solo.append(f"G{gi:02d}")
             elif gi == 80:
                 self.cancel_cycle()
-            elif gi in CYCLE_TEMPLATES:
-                cycle_code = gi
             elif gi in CYCLE_MAP:
+                # Before CYCLE_TEMPLATES: a Fanuc code can name a different BX
+                # cycle (Fanuc G87 back boring is not BX G87 chip-break).
                 self.warn(f"G{gi} not supported; mapped to G{CYCLE_MAP[gi]} - verify")
                 cycle_code = CYCLE_MAP[gi]
+            elif gi in CYCLE_TEMPLATES:
+                cycle_code = gi
             elif gi == 98:
                 self.cycle_return = 'init'
             elif gi == 99:
@@ -304,17 +382,13 @@ class Converter:
                 self.emit([w])
         if 'H' in vals:
             vals.pop('H')
-        dword = None
         if 'D' in vals:
-            d = vals.pop('D')
-            if KEEP_D_WORD and comp in ('G41', 'G42'):
-                dword = f"D{int(d)}"
-            elif not KEEP_D_WORD:
-                self.warn("D (comp offset) word removed")
-        if dword:
-            comp = comp + '|' + dword
+            # On the BX a D word stores a tool DIAMETER (and needs T in the
+            # same block), so a Fanuc offset number must never reach it.
+            vals.pop('D')
+            self.warn("D (comp offset) word removed")
         if 'F' in vals:
-            self.feed = vals.pop('F')
+            self.set_feed(vals.pop('F'))
 
         self.do_m_codes(ms, vals, before=True)
 
@@ -336,7 +410,7 @@ class Converter:
                     self.do_linear(vals, comp)
                 comp = None
             if comp:
-                self.emit([w for w in comp.split('|') if w])
+                self.emit([comp])
 
         self.do_m_codes(ms, vals, before=False)
 
@@ -347,12 +421,13 @@ class Converter:
                 if 'T' not in vals:
                     self.warn("M06 without T word")
                 t = int(vals.get('T', 0))
-                if t > MAX_TOOL:
-                    self.warn(f"tool T{t} is above the BX limit of {MAX_TOOL}")
+                if not 1 <= t <= MAX_TOOL:
+                    self.warn(f"tool T{t}: this BX build's M06 only takes T1-T{MAX_TOOL} (BAD TOOL #)")
                 self.emit_m25()
                 self.emit([f"T{t}", "M06"])
                 self.emit_m25()
             elif 'T' in vals:
+                # A BX block with T and no M06 writes S/L/D into the tool table.
                 self.warn("tool pre-select (T without M06) dropped")
             spin = [m for m in ms if m in (3, 4)]
             if 'S' in vals or spin:
@@ -362,9 +437,13 @@ class Converter:
                     if rpm and not (RPM_RANGE[0] <= rpm <= RPM_RANGE[1]):
                         self.warn(f"S{rpm} outside BX spindle range {RPM_RANGE[0]}-{RPM_RANGE[1]}")
                     w.append(f"S{rpm}")
+                    self.rpm_known = self.rpm_known or rpm > 0
                 if spin:
+                    if not self.rpm_known:
+                        self.warn("spindle started with no S word (the BX stops with NO RPM)")
                     w.append(f"M{spin[0]:02d}")
                     self.spindle_on = True
+                    self.spindle_dir = spin[0]
                 self.emit(w)
             for m in ms:
                 if m in (7, 8):
@@ -419,16 +498,10 @@ class Converter:
 
     def do_linear(self, vals, comp):
         t = self.target(vals)
-        words = []
-        dword = None
-        if comp:
-            comp, _, dword = comp.partition('|')
-            words.append(comp)
+        words = [comp] if comp else []
         for a in 'XYZ':
             if a in vals:
-                words.append(a + fnum(t[a]))
-        if dword:
-            words.append(dword)
+                words.append(a + self.num(t[a]))
         self.motion_word(self.motion, words)
         if self.motion == 1:
             self.feed_word(words)
@@ -494,7 +567,7 @@ class Converter:
                     p[v] = cv + r0 * math.sin(ang)
                     if helical:
                         p[w] = sw0 + (sw1 - sw0) * k / nseg
-                words = [a + fnum(p[a]) for a in 'XYZ' if p[a] is not None]
+                words = [a + self.num(p[a]) for a in 'XYZ' if p[a] is not None]
                 self.motion_word(1, words)
                 self.feed_word(words)
                 self.emit(words)
@@ -508,7 +581,7 @@ class Converter:
             pitch = (sw1 - sw0) * 2 * math.pi / sweep
             if HELIX_K == 'unsigned':
                 pitch = abs(pitch)
-            kword = 'K' + fnum(pitch)
+            kword = 'K' + self.num(pitch)
         for k in range(1, nseg + 1):
             if k == nseg:
                 px, py, pz = eu, ev, sw1
@@ -520,11 +593,11 @@ class Converter:
             words = []
             if comp and k == 1:
                 self.warn("cutter comp change on an arc; comp code put on its own block")
-                self.emit([comp.split('|')[0]])
-            words += ['X' + fnum(px), 'Y' + fnum(py)]
+                self.emit([comp])
+            words += ['X' + self.num(px), 'Y' + self.num(py)]
             if helical or ('Z' in vals and pz is not None):
-                words.append('Z' + fnum(pz))
-            words += ['I' + fnum(cu), 'J' + fnum(cv)]
+                words.append('Z' + self.num(pz))
+            words += ['I' + self.num(cu), 'J' + self.num(cv)]
             if kword:
                 words.append(kword)
             self.motion_word(self.motion, words)
@@ -550,9 +623,10 @@ class Converter:
         mx, my = (sx + ex) / 2, (sy + ey) / 2
         return mx + side * h * nx, my + side * h * ny
 
-    def dwell_seconds(self, vals):
-        """Fanuc: X = seconds, P = milliseconds unless written with a decimal."""
-        if 'X' in vals:
+    def dwell_seconds(self, vals, x_is_time=True):
+        """Fanuc: X = seconds, P = milliseconds unless written with a decimal.
+        In a canned-cycle block X is the hole position, so only P counts."""
+        if x_is_time and 'X' in vals:
             return vals['X']
         if 'P' in vals:
             raw = self.raw.get('P', '')
@@ -563,65 +637,146 @@ class Converter:
     # --------------------------------------------------------------- cycles
     def rapid_z(self, z):
         if self.pos['Z'] is None or abs(self.pos['Z'] - z) > EPS:
-            w = ['Z' + fnum(z)]
+            w = ['Z' + self.num(z)]
             self.motion_word(0, w)
             self.emit(w)
             self.pos['Z'] = z
 
     def feed_z(self, z):
-        w = ['Z' + fnum(z)]
+        w = ['Z' + self.num(z)]
         self.motion_word(1, w)
         self.feed_word(w)
         self.emit(w)
         self.pos['Z'] = z
 
     def expand_cycle(self, c, moved=True):
+        """One hole as plain G00/G01 moves (82 and 89 only get here without a dwell)."""
         code, r, depth = c['code'], c['R'], c['Z']
         if r is None or depth is None:
             self.warn(f"G{code} missing R or Z; hole skipped")
             return
         ret = c['init_z'] if (self.cycle_return == 'init' and c['init_z'] is not None) else r
         if moved:
-            w = ['X' + fnum(self.pos['X']), 'Y' + fnum(self.pos['Y'])]
+            w = ['X' + self.num(self.pos['X']), 'Y' + self.num(self.pos['Y'])]
             self.motion_word(0, w)
             self.emit(w)
         self.rapid_z(r)
-        if code == 83:
+        if code in (83, 87):
             q = c['Q'] or abs(r - depth)
             if not c['Q']:
-                self.warn("G83 without Q: drilled in one peck")
+                self.warn(f"G{code} without Q: drilled in one peck")
             cur = r
             while cur > depth + EPS:
                 nxt = max(depth, cur - q)
-                if cur < r - EPS:
-                    self.rapid_z(min(r, cur + PECK_CLEARANCE))
+                if code == 83 and cur < r - EPS:
+                    self.rapid_z(min(r, cur + self.unit(PECK_CLEARANCE)))
                 self.feed_z(nxt)
                 cur = nxt
                 if cur > depth + EPS:
-                    self.rapid_z(r)
+                    # G83 clears the chips at R; G87 (Fanuc G73) only breaks them
+                    self.rapid_z(r if code == 83 else cur + self.unit(CHIP_BREAK))
         else:
             self.feed_z(depth)
-            if code == 82 and c.get('P'):
-                self.emit(['G04', 'P' + fnum(c['P'], 3)])
-                self.last_motion_out = None
-            if code == 85:
+            if code in (85, 89):
                 self.feed_z(r)
+            elif code == 86:
+                self.warn("G86 expanded as feed in, spindle stop, rapid out")
+                self.emit(['M05'])
+                self.rapid_z(ret)
+                if self.spindle_on:
+                    self.emit([f"M{self.spindle_dir:02d}"])
         self.rapid_z(ret)
+        c['end_z'] = ret
+
+    def native_cycle(self, c):
+        """
+        One hole as a BX canned cycle.  The BX measures the depth down from
+        the Z the cycle starts at and retracts back to it, so the converter
+        picks that start (the R plane, or the initial Z under G98), gets the
+        tool there, and writes the depth and pecks relative to it.
+        """
+        code, r, depth = c['code'], c['R'], c['Z']
+        if r is None or depth is None:
+            self.warn(f"G{code} missing R or Z; hole skipped")
+            return
+        init = c['init_z']
+        if self.cycle_return == 'init' and init is not None and init > r + EPS:
+            start = init
+            self.warn("G98 native cycle: the BX has no R plane, so it feeds down "
+                      "from the initial Z and returns there")
+        else:
+            start = r
+        total = start - depth
+        if total <= EPS:
+            self.warn(f"G{code} depth is not below the start height; hole skipped")
+            return
+        out, extra, pecks = code, [], []
+        if code in (82, 89):
+            word = self.dwell_word(c['P']) if c['P'] else None
+            if word:
+                extra = ['G04', word]
+                self.warn(f"G{code} with a dwell sent as a native cycle (the BX only "
+                          f"dwells inside G82/G89) - verify")
+            else:
+                out = 81 if code == 82 else 85
+        elif code in (83, 87):
+            q = c['Q']
+            if not q:
+                self.warn(f"G{code} without Q: drilled in one peck")
+            first = (start - r) + q if q else total
+            if first >= total - EPS:
+                out = 81        # one peck reaches the bottom; the BX needs Z2 < Z1
+            else:
+                pecks = ['Z' + self.num(first), 'Z' + self.num(q)]
+        elif code == 84:
+            self.warn("G84 tapping sent as a native cycle - verify on the machine")
+        elif code == 86:
+            self.warn("G86 backs off by the machine's X/Y BACKOFF (G86 I/J) "
+                      "parameters - check them")
+        if self.feed is None:
+            self.warn(f"G{code} with no F (the BX stops with NO FEED RATE)")
+
+        xy = ['X' + self.num(self.pos['X']), 'Y' + self.num(self.pos['Y'])]
+        params = (out, start, total, tuple(pecks), tuple(extra), self.feed)
+        if c.get('native') and params == c['sent']:
+            self.emit(xy)               # another hole of the same cycle
+            return
+        if c.get('native'):
+            self.emit(['G80'])          # new parameters: leave and re-enter
+            self.pos['Z'] = c['end_z']
+            self.last_motion_out = None
+        # The cycle starts wherever Z is, and Z must be known there
+        # (CANNED Z FROM UNKNOWN POSITION).  Going down, be over the hole first.
+        if self.pos['Z'] is None or start < self.pos['Z'] - EPS:
+            w = list(xy)
+            self.motion_word(0, w)
+            self.emit(w)
+        self.rapid_z(start)
+        words = [f"G{out}"] + extra + xy + ['Z' + self.num(total)] + pecks
+        if self.feed is not None:
+            # The canned feed is its own register: last_feed_out is untouched.
+            words.append('F' + fnum(self.feed, FEED_DEC))
+        self.emit(words)
+        c.update(sent=params, native=True, end_z=start)
+        self.last_motion_out = None
+        self.pos['Z'] = start
 
     def cancel_cycle(self):
         if not self.cycle:
             return
-        if self.cycle.get('native'):
-            self.emit(['G80'])
         c = self.cycle
-        self.pos['Z'] = c['init_z'] if self.cycle_return == 'init' else c['R']
+        if c.get('native'):
+            self.emit(['G80'])
+        if c.get('end_z') is not None:
+            self.pos['Z'] = c['end_z']
         self.cycle = None
         self.last_motion_out = None
 
     def do_cycle(self, code, vals, new_line):
         if self.cycle is None:
-            self.cycle = {'code': code, 'init_z': self.pos['Z'],
-                          'R': None, 'Z': None, 'Q': None, 'P': None, 'sent': None}
+            self.cycle = {'code': code, 'init_z': self.pos['Z'], 'R': None,
+                          'Z': None, 'Q': None, 'P': None, 'sent': None,
+                          'native': False, 'end_z': None}
         c = self.cycle
         c['code'] = code
         if 'R' in vals:
@@ -634,49 +789,24 @@ class Converter:
         if 'Q' in vals:
             c['Q'] = abs(vals['Q'])
         if 'P' in vals:
-            c['P'] = self.dwell_seconds(vals)
-        native = CYCLE_MODE != 'expand' or code == 84
-        c['native'] = native
-        if not native:
-            moved = False
-            for a in 'XY':
-                if a in vals:
-                    new = vals[a] if self.absolute else self.pos[a] + vals[a]
-                    moved |= self.pos[a] is None or abs(new - self.pos[a]) > EPS
-                    self.pos[a] = new
-            self.expand_cycle(c, moved)
-            return
-        if code == 84:
-            self.warn("G84 tapping sent as a native cycle - verify format on the machine")
-        if c.get('P'):
-            self.warn(f"G{code} dwell dropped in native mode - Hurco cycle dwell word unknown")
+            c['P'] = self.dwell_seconds(vals, x_is_time=False)
+        native = (CYCLE_MODE != 'expand' or code == 84
+                  or (code in (82, 89) and bool(c['P'])))
+        if c['native'] and not native:
+            self.emit(['G80'])
+            self.pos['Z'] = c['end_z']
+            c.update(native=False, sent=None)
+            self.last_motion_out = None
+        moved = False
         for a in 'XY':
             if a in vals:
-                self.pos[a] = vals[a] if self.absolute else self.pos[a] + vals[a]
-
-        tmpl = CYCLE_TEMPLATES[code]
-        params = (code, c['R'], c['Z'], c['Q'], self.feed)
-        words = ['X' + fnum(self.pos['X']), 'Y' + fnum(self.pos['Y'])]
-        if params != c['sent']:
-            words.insert(0, f"G{code}")
-            for key in tmpl:
-                val = c[key]
-                if key == 'Q':
-                    if val is None:
-                        val = abs((c['R'] or 0) - (c['Z'] or 0))
-                        self.warn(f"G{code} without Q: peck set to full depth")
-                    val *= PECK_SIGN
-                if val is None:
-                    self.warn(f"G{code} missing {key} value")
-                    continue
-                words.append('Z' + fnum(val))
-            if self.feed is not None:
-                words.append('F' + fnum(self.feed, FEED_DEC))
-                self.last_feed_out = self.feed
-            c['sent'] = params
-        self.emit(words)
-        self.last_motion_out = None
-        self.pos['Z'] = c['init_z'] if self.cycle_return == 'init' else c['R']
+                new = vals[a] if self.absolute else self.pos[a] + vals[a]
+                moved |= abs(new - self.pos[a]) > EPS
+                self.pos[a] = new
+        if native:
+            self.native_cycle(c)
+        else:
+            self.expand_cycle(c, moved)
 
     # --------------------------------------------------------------- result
     def result(self):
@@ -700,10 +830,18 @@ def convert(text, helix_max=HELIX_MAX_DEG):
 # Independent output checker
 # ─────────────────────────────────────────────────────────────────────────────
 def check(text):
-    """Independent check of a Hurco-format file. Returns (problems, stats)."""
+    """
+    Independent check of a Hurco-format file. Returns (problems, stats).
+
+    Besides the format (%, E, N numbers, one G code per block), it applies
+    the rules the BX firmware enforces on a block, so output that would stop
+    the control with an error is reported here first.
+    """
     probs = []
     pos = {'X': None, 'Y': None, 'Z': None}
     motion = None
+    cycle = None          # the G8x code of the active native cycle
+    metric = False
     worst = 0.0
     arcs = 0
     lines = text.splitlines()
@@ -716,39 +854,98 @@ def check(text):
     for ln in lines[1:-1]:
         if not ln.strip():
             continue
-        m = re.fullmatch(r'N(\d+)((?:[A-Z][-]?\d*\.?\d*)+)', ln.strip())
+        m = re.fullmatch(r'N(\d+)((?:[A-Z/][-]?\d*\.?\d*)+)', ln.strip())
         if not m:
             probs.append(f"bad block: {ln}")
             continue
-        if int(m.group(1)) != expect:
+        n = int(m.group(1))
+        if n != expect:
             probs.append(f"N sequence break at {ln}")
-        expect = int(m.group(1)) + N_STEP
+        if n > N_MAX:
+            probs.append(f"N number above N{N_MAX}: {ln}")
+        expect = n + N_STEP if n + N_STEP <= N_MAX else N_START
         w = [(L, float(v))
-             for L, v in re.findall(r'([A-Z])(-?\d*\.?\d*)', m.group(2))
+             for L, v in re.findall(r'([A-Z/])(-?\d*\.?\d*)', m.group(2))
              if re.fullmatch(r'-?(?:\d+\.?\d*|\.\d+)', v)]
         gs = [int(v) for L, v in w if L == 'G']
+        ms = [int(v) for L, v in w if L == 'M']
+        zs = [v for L, v in w if L == 'Z']
+        letters = {L for L, v in w}
         if re.search(r'G9[01]\.', ln):
             probs.append(f"G90.x/G91.x code (control may read it as G91): {ln}")
-        if len(gs) > 1:
+        # G04 may share a block with the G82/G89 that uses its dwell
+        if len(gs) > 1 and sorted(gs) not in ([4, 82], [4, 89]):
             probs.append(f"more than one G code: {ln}")
         for g in gs:
             if g not in ALLOWED_G:
                 probs.append(f"unsupported G{g}: {ln}")
+        if len(ms) > 1:
+            probs.append(f"more than one M code: {ln}")
         for L, v in w:
             if L == 'M' and int(v) not in ALLOWED_M:
                 probs.append(f"unsupported M{int(v)}: {ln}")
-            if L not in 'NGMXYZIJKFSTPD':
+            if L not in 'NGMXYZIJKFSTD/':
                 probs.append(f"unexpected word {L}: {ln}")
         vals = dict((L, v) for L, v in w if L not in 'GM')
+
+        # ---- words the firmware ties to other words
+        if 4 in gs:
+            t = vals.get('/')
+            if t is None or t != int(t) or not 0 < t <= DWELL_MAX:
+                probs.append(f"G04 without a /dwell of 1-{DWELL_MAX} (BAD DWELL TIME): {ln}")
+        elif '/' in letters:
+            probs.append(f"/dwell word without G04: {ln}")
+        if 'D' in letters and 'T' not in letters:
+            probs.append(f"D without T (TOOL SIZE & NO TOOL #): {ln}")
+        if 'S' in letters and 'T' in letters:
+            probs.append(f"S in a T block sets that tool's rpm, not the spindle's: {ln}")
+        if 6 in ms and 'T' not in letters:
+            probs.append(f"M06 without T (NO TOOL #): {ln}")
+        if 'F' in vals and vals['F'] > (MAX_FEED_METRIC if metric else MAX_FEED) + EPS:
+            probs.append(f"F above the BX limit (BAD FEED RATE): {ln}")
+        if 70 in gs or 71 in gs:
+            metric = 71 in gs
+
+        # ---- modal state
+        cyc = next((g for g in gs if g in CYCLE_TEMPLATES), None)
+        if 80 in gs:
+            if cycle is None:
+                probs.append(f"G80 with no canned cycle active (G80 DOES NOT FOLLOW G81-G89): {ln}")
+            cycle = None
+            motion = None
         for g in gs:
             if g in (0, 1, 2, 3):
+                if cycle is not None:
+                    probs.append(f"G{g:02d} while canned cycle G{cycle} is active: {ln}")
+                    cycle = None
                 motion = g
-            if g in range(81, 86):
-                motion = 'cycle'
-            if g == 80:
-                motion = None
-        if any(v == 25 for L, v in w if L == 'M'):
+        if any(v == 25 or v == 6 for L, v in w if L == 'M'):
             pos['Z'] = None
+            cycle = None
+
+        if cyc is not None:
+            motion = 'cycle'
+            n_z = len(CYCLE_TEMPLATES[cyc])
+            if not zs:
+                probs.append(f"canned cycle without a depth (MISSING Z IN CANNED CYCLE): {ln}")
+            elif len(zs) > n_z or (n_z == 3 and len(zs) < 2):
+                probs.append(f"G{cyc} needs {'2-3' if n_z == 3 else 1} Z words: {ln}")
+            elif len(zs) > 1 and abs(zs[1]) >= abs(zs[0]):
+                probs.append(f"first peck not less than the depth (BAD Z IN CANNED CYCLE): {ln}")
+            if 'F' not in vals:
+                probs.append(f"canned cycle without F (NO FEED RATE): {ln}")
+            if cyc in (82, 89) and 4 not in gs:
+                probs.append(f"G{cyc} without a G04 dwell: {ln}")
+            if pos['Z'] is None:
+                probs.append(f"canned cycle from unknown Z (CANNED Z FROM UNKNOWN POSITION): {ln}")
+            cycle = cyc
+        elif len(zs) > 1:
+            probs.append(f"more than one Z word outside G83/G87 (EXTRA Z COMMAND): {ln}")
+        elif cycle is not None and 'Z' in vals:
+            probs.append(f"Z word on a canned-cycle hole block: {ln}")
+        if motion not in (2, 3) and letters & set('IJK'):
+            probs.append(f"I/J/K on a block that is not an arc (IJK & NON-CIRCULAR MOTION): {ln}")
+
         if motion in (2, 3) and 'Z' in vals and pos['Z'] is not None:
             dz = vals['Z'] - pos['Z']
             if abs(dz) > 1e-9:
@@ -788,6 +985,7 @@ def check(text):
                             probs.append(f"K pitch disagrees with Z travel "
                                          f"({expect_dz:.4f} vs {dz:.4f}): {ln}")
         for a in 'XYZ':
+            # a cycle's Z words are depths, and its holes return to the start Z
             if a in vals and not (motion == 'cycle' and a == 'Z'):
                 pos[a] = vals[a]
     return probs, {'arcs': arcs, 'worst_radius_error': round(worst, 5),
@@ -815,6 +1013,9 @@ class BackplotParser:
     M25 has no coordinate in the output, so the Z it retracts to is inferred as
     the highest Z the program ever commands (pre-scanned) — enough to keep the
     plotted path connected and correctly ordered.
+
+    A G00 that moves Z and XY together is drawn the way the firmware runs it:
+    Z first when going up, XY first when going down.
     """
 
     def __init__(self) -> None:
@@ -830,7 +1031,7 @@ class BackplotParser:
         x = y = 0.0
         z = z_home
         motion = 0
-        cycle: Optional[Dict] = None   # native G8x state: {'code', 'r', 'depth'}
+        cycle: Optional[Dict] = None   # native G8x state: {'start', 'bottom'}
 
         for raw in bnc.splitlines():
             block = raw.strip()
@@ -857,12 +1058,12 @@ class BackplotParser:
                 if g in (0, 1, 2, 3):
                     motion = g
 
-            # ── Native canned cycle: G8x X Y Z(R) Z(depth) [Z(Q)] ────────
+            # ── Native canned cycle: G8x X Y Z(depth) [Z(peck1) Z(peck)] ─
+            # The depth is measured down from the Z the cycle starts at, and
+            # every hole returns there.
             cyc = next((g for g in gs if g in CYCLE_TEMPLATES), None)
             if cyc is not None:
-                tmpl = CYCLE_TEMPLATES[cyc]
-                named = dict(zip(tmpl, zs))
-                cycle = {'code': cyc, 'r': named.get('R'), 'depth': named.get('Z')}
+                cycle = {'start': z, 'bottom': z - abs(zs[0]) if zs else None}
                 x, y, z = self._drill(x, y, z, vals, cycle)
                 continue
 
@@ -891,7 +1092,12 @@ class BackplotParser:
             nz = vals.get('Z', z)
             seg: Segment = (x, y, z, nx, ny, nz)
             if motion == 0:
-                self.rapid.append(seg)
+                if abs(nz - z) > EPS and (abs(nx - x) > EPS or abs(ny - y) > EPS):
+                    mid = (x, y, nz) if nz > z else (nx, ny, z)
+                    self.rapid.append((x, y, z) + mid)
+                    self.rapid.append(mid + (nx, ny, nz))
+                else:
+                    self.rapid.append(seg)
             elif self._is_plunge(seg):
                 # CYCLE_MODE='expand' turns drilling into plain G01 Z moves;
                 # colour a pure downward feed as a plunge so holes stay visible.
@@ -915,8 +1121,10 @@ class BackplotParser:
 
     @staticmethod
     def _scan_z_home(bnc: str) -> float:
+        # A cycle block's Z words are depths, not heights, so they are skipped.
         zs = [float(m.group(1))
-              for m in re.finditer(r'(?<![A-Z])Z([-+]?(?:\d+\.?\d*|\.\d+))', bnc)]
+              for line in bnc.splitlines() if not re.search(r'G8[1-9]', line)
+              for m in re.finditer(r'(?<![A-Z])Z([-+]?(?:\d+\.?\d*|\.\d+))', line)]
         return max(zs + [0.0])
 
     @staticmethod
@@ -930,14 +1138,12 @@ class BackplotParser:
         ny = vals.get('Y', y)
         if (nx, ny) != (x, y):
             self.rapid.append((x, y, z, nx, ny, z))
-        r, depth = cycle.get('r'), cycle.get('depth')
-        if r is None or depth is None:
+        start, bottom = cycle['start'], cycle['bottom']
+        if bottom is None:
             return nx, ny, z
-        if abs(z - r) > EPS:
-            self.rapid.append((nx, ny, z, nx, ny, r))
-        self.plunge.append((nx, ny, r, nx, ny, depth))
-        self.rapid.append((nx, ny, depth, nx, ny, r))
-        return nx, ny, r
+        self.plunge.append((nx, ny, start, nx, ny, bottom))
+        self.rapid.append((nx, ny, bottom, nx, ny, start))
+        return nx, ny, start
 
     @staticmethod
     def _arc_points(x0, y0, z0, x1, y1, z1, cx, cy, cw):
@@ -1492,49 +1698,62 @@ class FindBar(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 # Codes-used panel
 # ─────────────────────────────────────────────────────────────────────────────
-# What each code does.  BX-MPU wording follows Gcodes.pdf (the AMTS sheet);
-# codes the BX-MPU does not take carry their usual Fanuc mill meaning, and a
-# code that means something different on each gets both.
+# What each code does.  BX-MPU wording follows Gcodes.pdf (the AMTS sheet),
+# corrected and extended from the firmware analysis ("GCODES from
+# Analysis.md"), which found codes the sheet leaves out and dropped the ones
+# it lists that the firmware rejects (G09, G61, G64).  Codes the BX-MPU does
+# not take carry their usual Fanuc mill meaning, and a code that means
+# something different on each gets both.
 BX_CODES = {
     ('G', 0): 'Rapid traverse',
     ('G', 1): 'Linear interpolation (straight feed move)',
     ('G', 2): 'Clockwise circular and helical interpolation',
     ('G', 3): 'Counterclockwise circular and helical interpolation',
-    ('G', 4): 'Dwell (one-shot)',
-    ('G', 9): 'Precision cornering (one-shot)',
+    ('G', 4): 'Dwell, written G04/t; the time is used by the G82/G89 cycles',
+    ('G', 16): 'Accepted; no effect found in the firmware',
     ('G', 17): 'XY plane selection',
+    ('G', 18): 'XZ plane selection',
+    ('G', 19): 'YZ plane selection (the AMTS sheet mislabels it XZ)',
     ('G', 40): 'Cutter compensation off',
     ('G', 41): 'Cutter compensation left',
     ('G', 42): 'Cutter compensation right',
-    ('G', 61): 'Precision cornering mode on',
-    ('G', 64): 'Precision cornering mode off',
     ('G', 70): 'English (inch) units',
     ('G', 71): 'Metric units',
-    ('G', 75): 'Multi-quadrant circular interpolation mode (power-up default)',
+    ('G', 74): 'Single-quadrant circular interpolation mode (unsigned I/J)',
+    ('G', 75): 'Multi-quadrant circular interpolation mode (power-up default); '
+               'under G90, I/J are the absolute arc center',
     ('G', 80): 'Fixed cycle cancel',
-    ('G', 81): 'Drill cycle',
-    ('G', 82): 'Drill with dwell cycle',
-    ('G', 83): 'Deep hole (peck) drilling cycle',
+    ('G', 81): 'Drill cycle: feed to depth, rapid out',
+    ('G', 82): 'Drill with dwell cycle: feed to depth, dwell, rapid out',
+    ('G', 83): 'Deep hole peck drilling cycle: rapid back to the start Z after each peck',
     ('G', 84): 'Tapping cycle',
-    ('G', 85): 'Boring cycle',
+    ('G', 85): 'Boring cycle: feed in, feed out',
+    ('G', 86): 'Boring cycle: spindle stop and orient, X/Y back-off, rapid out',
+    ('G', 87): 'Chip-break peck drilling cycle: backs off 0.050 in after each peck',
+    ('G', 89): 'Boring with dwell cycle: feed in, dwell, feed out',
     ('G', 90): 'Absolute positioning',
     ('G', 91): 'Incremental positioning',
+    ('G', 92): 'Set position: the current position becomes the given X Y Z',
+    ('G', 99): 'Accepted and ignored',
     ('M', 0): 'Program stop',
-    ('M', 1): 'Planned (optional) stop',
+    ('M', 1): 'Optional stop (when the OPTIONAL STOP parameter is 1)',
     ('M', 2): 'End of program',
     ('M', 3): 'Spindle on clockwise',
     ('M', 4): 'Spindle on counterclockwise',
     ('M', 5): 'Spindle off',
-    ('M', 6): 'Tool change',
+    ('M', 6): 'Tool change (T1-T12 on this build)',
     ('M', 7): 'Mist coolant on',
     ('M', 8): 'Flood coolant on',
     ('M', 9): 'Coolant off',
+    ('M', 19): 'Oriented spindle stop',
+    ('M', 20): 'Pulse the rotary indexer once',
     ('M', 25): 'Z retract to machine home',
 }
 FANUC_CODES = {
+    ('G', 9): 'Exact stop (one-shot)',
     ('G', 10): 'Programmable data input (sets offsets)',
     ('G', 18): 'ZX plane selection',
-    ('G', 19): 'YZ plane selection (the AMTS sheet lists G19 as XZ)',
+    ('G', 19): 'YZ plane selection',
     ('G', 20): 'Inch units',
     ('G', 21): 'Metric units',
     ('G', 28): 'Return to machine home (reference point)',
@@ -1550,6 +1769,8 @@ FANUC_CODES = {
     ('G', 57): 'Work offset 4',
     ('G', 58): 'Work offset 5',
     ('G', 59): 'Work offset 6',
+    ('G', 61): 'Exact stop mode',
+    ('G', 64): 'Cutting mode (exact stop off)',
     ('G', 65): 'Macro call',
     ('G', 68): 'Coordinate rotation',
     ('G', 69): 'Coordinate rotation cancel',

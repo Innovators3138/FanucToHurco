@@ -206,37 +206,114 @@ def test_g98_returns_to_initial_z_g99_to_r():
 
 def test_unsupported_cycle_is_remapped():
     _, warns = run('G0 X1 Y1 Z0.5\nG73 X1 Y1 Z-0.2 R0.1 Q0.05 F5\nG80\nM30')
-    assert 'G73 not supported; mapped to G83 - verify' in warns
+    assert 'G73 not supported; mapped to G87 - verify' in warns
 
 
-def test_native_mode_writes_cycle_template(monkeypatch):
+@pytest.mark.parametrize('fanuc, bx', [(73, 87), (74, 84), (76, 86), (87, 85), (88, 85)])
+def test_fanuc_cycle_maps_to_its_bx_counterpart(monkeypatch, fanuc, bx):
+    """Fanuc G87 is back boring; it must not reach the BX's G87 (chip-break)."""
     monkeypatch.setattr(m, 'CYCLE_MODE', 'native')
-    out, _ = run('G0 X1 Y1 Z0.5\nG83 X1 Y1 Z-0.25 R0.1 Q0.1 F5\nX2\nG80\nM30')
+    out, warns = run(f'G0 X1 Y1 Z0.5\nS500 M3\nG99 G{fanuc} X1 Y1 Z-0.3 R0.1 Q0.1 F5\nG80\nM30')
+    assert f'G{fanuc} not supported; mapped to G{bx} - verify' in warns
+    assert any(b.startswith(f'G{bx}X') for b in blocks(out))
+
+
+def test_g73_expands_as_chip_break_not_full_retract():
+    """Fanuc G73 -> G87: after each peck the tool backs off 0.05, not to R."""
+    out, _ = run('G0 X1 Y1 Z0.5\nG73 X1 Y1 Z-0.3 R0.1 Q0.1 F5\nG80\nM30')
+    ups = [words(b)['Z'] for b in blocks(out) if b.startswith('G00Z')][:-1]
+    assert ups == pytest.approx([0.05, -0.05, -0.15])
+
+
+def test_g86_expands_with_spindle_stop_at_the_bottom():
+    out, _ = run('G0 X1 Y1 Z0.5\nS800 M3\nG86 X1 Y1 Z-0.3 R0.1 F5\nG80\nM30')
     b = blocks(out)
-    assert 'G83X1.Y1.Z0.1Z-0.25Z0.1F5.' in b
-    assert 'X2.Y1.' in b and 'G80' in b
+    i = b.index('M05')
+    assert words(b[i - 1])['Z'] == -0.3 and b[i + 1] == 'G00Z0.5' and b[i + 2] == 'M03'
+
+
+# ── native cycles: depth below the start Z, no R plane ──────────────────────
+def test_native_g99_rapids_to_r_then_drills_down_from_it(monkeypatch):
+    monkeypatch.setattr(m, 'CYCLE_MODE', 'native')
+    out, _ = run('G0 X0 Y0 Z0.5\nG99 G83 X1 Y1 Z-0.25 R0.1 Q0.1 F5\nX2\nG80\nM30')
+    b = blocks(out)
+    i = b.index('G83X1.Y1.Z0.35Z0.1Z0.1F5.')       # depth, first peck, peck
+    assert b[i - 2:i] == ['X1.Y1.', 'Z0.1']          # over the hole, then down to R
+    assert b[i + 1:i + 3] == ['X2.Y1.', 'G80']
+
+
+def test_native_g98_starts_from_the_initial_z(monkeypatch):
+    """No R plane on the BX: to come back up to the initial Z, start there."""
+    monkeypatch.setattr(m, 'CYCLE_MODE', 'native')
+    out, warns = run('G0 X1 Y1 Z0.5\nG98 G83 X1 Y1 Z-0.25 R0.1 Q0.1 F5\nG80\nM30')
+    assert 'G83X1.Y1.Z0.75Z0.5Z0.1F5.' in blocks(out)   # first peck covers the air gap
+    assert any('no R plane' in w for w in warns)
+
+
+def test_native_peck_that_reaches_the_bottom_is_a_plain_drill(monkeypatch):
+    monkeypatch.setattr(m, 'CYCLE_MODE', 'native')
+    out, _ = run('G0 X1 Y1 Z0.5\nG99 G83 X1 Y1 Z-0.2 R0.1 Q0.5 F5\nG80\nM30')
+    assert 'G81X1.Y1.Z0.3F5.' in blocks(out)
+
+
+def test_native_cycle_change_re_enters_with_g80(monkeypatch):
+    monkeypatch.setattr(m, 'CYCLE_MODE', 'native')
+    out, _ = run('G0 X1 Y1 Z0.5\nG99 G81 X1 Y1 Z-0.2 R0.1 F5\nX2 Z-0.4\nG80\nM30')
+    cyc = [b for b in blocks(out) if b.startswith('G8')]
+    assert cyc == ['G81X1.Y1.Z0.3F5.', 'G80', 'G81X2.Y1.Z0.5F5.', 'G80']
+
+
+def test_native_cycle_feed_does_not_count_as_the_g01_feed(monkeypatch):
+    """The BX keeps the canned feed apart from the G01 feed."""
+    monkeypatch.setattr(m, 'CYCLE_MODE', 'native')
+    out, _ = run('G0 X1 Y1 Z0.5\nG81 X1 Y1 Z-0.2 R0.1 F5\nG80\nG1 X3 F5\nM30')
+    assert 'G01X3.F5.' in blocks(out)
+
+
+def test_native_cycle_after_m25_moves_z_first(monkeypatch):
+    """CANNED Z FROM UNKNOWN POSITION: Z has to be known when a cycle starts."""
+    monkeypatch.setattr(m, 'CYCLE_MODE', 'native')
+    out, _ = run('T1 M6\nG0 X1 Y1\nG81 X1 Y1 Z-0.2 R0.1 F5\nG80\nM30')
+    b = blocks(out)
+    assert b[b.index('G81X1.Y1.Z0.3F5.') - 1] == 'Z0.1'
+
+
+def test_g82_dwell_is_native_with_g04_in_the_block():
+    out, _ = run('G0 X1 Y1 Z0.5\nG99 G82 X1 Y1 Z-0.2 R0.1 P500 F5\nG80\nM30')
+    assert 'G82G04/5X1.Y1.Z0.3F5.' in blocks(out)
+
+
+def test_g82_without_dwell_is_still_expanded():
+    out, _ = run('G0 X1 Y1 Z0.5\nG82 X1 Y1 Z-0.2 R0.1 F5\nG80\nM30')
+    assert not re.search(r'G8\d', out)
 
 
 def test_g84_is_native_even_when_expanding():
-    out, warns = run('G0 X1 Y1 Z0.5\nS500 M3\nG84 X1 Y1 Z-0.3 R0.1 F10\nG80\nM30')
-    assert 'G84X1.Y1.Z0.1Z-0.3F10.' in blocks(out)
-    assert 'G84 tapping sent as a native cycle - verify format on the machine' in warns
+    out, warns = run('G0 X1 Y1 Z0.5\nS500 M3\nG99 G84 X1 Y1 Z-0.3 R0.1 F10\nG80\nM30')
+    assert 'G84X1.Y1.Z0.4F10.' in blocks(out)
+    assert 'G84 tapping sent as a native cycle - verify on the machine' in warns
 
 
 # ── words and limits ─────────────────────────────────────────────────────────
 @pytest.mark.parametrize('src, block', [
-    ('G4 P500', 'G04P0.5'),          # P without a decimal is milliseconds
-    ('G4 P1.5', 'G04P1.5'),          # with one it is seconds
-    ('G4 X2', 'G04P2.'),
+    ('G4 P500', 'G04/5'),            # P without a decimal is milliseconds
+    ('G4 P1.5', 'G04/15'),           # with one it is seconds
+    ('G4 X2', 'G04/20'),
 ])
-def test_dwell_is_written_in_seconds(src, block):
+def test_dwell_is_written_as_a_slash_word(src, block):
     out, _ = run(src + '\nM30')
     assert block in blocks(out)
 
 
 @pytest.mark.parametrize('src, warning', [
-    ('T30 M6', 'tool T30 is above the BX limit of 24'),
-    ('S9000 M3', 'S9000 outside BX spindle range 60-4000'),
+    ('T13 M6', "tool T13: this BX build's M06 only takes T1-T12 (BAD TOOL #)"),
+    ('S9000 M3', 'S9000 outside BX spindle range 40-3680'),
+    ('S20 M3', 'S20 outside BX spindle range 40-3680'),
+    ('M3', 'spindle started with no S word (the BX stops with NO RPM)'),
+    ('G1 X1', 'feed move with no F before it (the BX stops with NO FEED RATE)'),
+    ('G61', 'G61 is not in the BX firmware (BAD G CODE); removed'),
+    ('G9 X1', 'G09 is not in the BX firmware (BAD G CODE); removed'),
+    ('G41 X1 Y1 F5', 'G41/G42 need a diameter stored for the tool on the BX (NO TOOL DIAMETER) - check the tool table'),
     ('G54', 'G54 not supported; removed'),
     ('M98', 'M98 not supported; removed'),
     ('G95', 'G95 feed-per-rev found: F values will be WRONG on the Hurco'),
@@ -256,3 +333,27 @@ def test_warnings_carry_source_line_numbers():
 def test_numbers_keep_a_decimal_point():
     out, _ = run('G0 X5 Y-3 Z0\nM30')
     assert 'G00X5.Y-3.Z0.' in blocks(out)
+
+
+def test_feed_above_the_bx_limit_is_clamped():
+    out, warns = run('G1 X1 F400\nM30')
+    assert 'G01X1.F250.' in blocks(out)
+    assert 'F400 above the BX limit of 250 ipm; clamped' in warns
+
+
+def test_metric_coordinates_have_three_decimals():
+    out, _ = run('G21\nG0 X1.23456 Y2\nM30')
+    assert 'G00X1.235Y2.' in blocks(out)
+
+
+def test_g61_and_g64_never_reach_the_output():
+    out, _ = run('G61\nG0 X1\nG64\nM30')
+    assert 'G61' not in out and 'G64' not in out
+
+
+def test_long_programs_number_again_from_the_start(monkeypatch):
+    monkeypatch.setattr(m, 'N_MAX', 40)
+    out, warns = run('\n'.join(f'G1 X{i} F10' for i in range(30)) + '\nM30')
+    numbers = [int(re.match(r'N(\d+)', ln).group(1)) for ln in out.splitlines()[1:-1]]
+    assert max(numbers) <= 40 and numbers.count(2) > 1
+    assert 'program is longer than N40; numbering starts again at N2' in warns

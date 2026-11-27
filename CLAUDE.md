@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Desktop GUI (PyQt6 + Matplotlib) that converts Onshape/Fanuc G-code into the Hurco BNC dialect spoken by an AMTS BX-MPU retrofit controller on a Hurco KMB-1 / MB-1 mill, backplots the result in 3D, and sends it over the network to the shop's Micro DNC drip-feed boxes. `Gcodes.pdf` is the authority for the BX-MPU vocabulary and output format; `program_out.nc` is a real Onshape post output used as a reference input sample.
+Desktop GUI (PyQt6 + Matplotlib) that converts Onshape/Fanuc G-code into the Hurco BNC dialect spoken by an AMTS BX-MPU retrofit controller on a Hurco KMB-1 / MB-1 mill, backplots the result in 3D, and sends it over the network to the shop's Micro DNC drip-feed boxes. `GCODES from Analysis.md` (reverse-engineered from the control's 55-80B3 firmware) is the authority for the BX-MPU vocabulary, word formats and limits; it corrects `Gcodes.pdf` (the AMTS sheet) where they disagree, and its section 7 lists the disagreements. `program_out.nc` is a real Onshape post output used as a reference input sample.
 
 ## Commands
 
@@ -52,7 +52,7 @@ problems, stats = m.check(out)          # independent validator, not the convert
 bp = m.BackplotParser(); bp.parse(out)  # segment counts for the plot
 ```
 
-`check()` is the fastest regression signal: it re-reads the output from scratch and should report no problems for any valid input. To drive the GUI itself without a display, set `QT_QPA_PLATFORM=offscreen`, build `MainWindow()`, and `.click()` the buttons.
+`check()` is the fastest regression signal: it re-reads the output from scratch and should report no problems for any valid input. Besides the format it applies the block rules the firmware enforces (its problem messages quote the control's error names: `NO FEED RATE`, `EXTRA Z COMMAND`, `G80 DOES NOT FOLLOW G81-G89` …), so output that would stop the machine fails here first. To drive the GUI itself without a display, set `QT_QPA_PLATFORM=offscreen`, build `MainWindow()`, and `.click()` the buttons.
 
 The DNC protocol client has its own CLI, which is the quickest way to poke a real machine:
 
@@ -88,7 +88,7 @@ PyInstaller follows the imports from `main.py`, so the build needs no changes fo
 2. **`Converter`** — the Fanuc→BNC state machine. `convert(text)` feeds each source line to `Converter.process()` and returns `(output_text, warnings)`, where warnings is an `OrderedDict` of `{message: [source line numbers]}`.
 3. **`check(text)`** — an *independent* re-reader of BNC output returning `(problems, stats)`. It deliberately shares no code with the converter beyond the settings constants, so it catches converter bugs rather than confirming them.
 4. **`BackplotParser`** / **`PlotCanvas`** — re-parse the converted output into `rapid` / `feed` / `plunge` segment lists and draw them on embedded 3D Matplotlib axes.
-5. **`MainWindow`** — Load / Convert / Verify / Save / Clear, over a three-pane splitter (input, output, backplot) with a Messages pane beneath. The input and output editors each have a `FindBar` (Ctrl+F, Enter/F3, Shift+Enter/Shift+F3, Esc). Its matching is `find_spans()`, which is headless-testable: a query that is one letter plus a number is matched by value through `WORD` outside comments (`G1` finds `G01`/`G1.` but not `G10`); anything else is a case-insensitive text search. Beside Messages, `CodesPanel` lists every G, M and T code with its input and output counts (amber: input only, green: output only); clicking a count calls that side's `FindBar.find()`, and clicking again steps on. Hovering a code shows `code_description()`, from `BX_CODES` (wording from `Gcodes.pdf`) and `FANUC_CODES`; tests require a description for everything in `ALLOWED_G`/`ALLOWED_M` and for every Fanuc code the converter handles, so adding to either list means adding its description. It counts through `code_words()`, the same tokenizer `find_spans()` uses, so a code it lists is always one the find bar can find.
+5. **`MainWindow`** — Load / Convert / Verify / Save / Clear, over a three-pane splitter (input, output, backplot) with a Messages pane beneath. The input and output editors each have a `FindBar` (Ctrl+F, Enter/F3, Shift+Enter/Shift+F3, Esc). Its matching is `find_spans()`, which is headless-testable: a query that is one letter plus a number is matched by value through `WORD` outside comments (`G1` finds `G01`/`G1.` but not `G10`); anything else is a case-insensitive text search. Beside Messages, `CodesPanel` lists every G, M and T code with its input and output counts (amber: input only, green: output only); clicking a count calls that side's `FindBar.find()`, and clicking again steps on. Hovering a code shows `code_description()`, from `BX_CODES` (wording from `Gcodes.pdf`, corrected from the firmware analysis) and `FANUC_CODES`; tests require a description for everything in `ALLOWED_G`/`ALLOWED_M` and for every Fanuc code the converter handles, so adding to either list means adding its description. It counts through `code_words()`, the same tokenizer `find_spans()` uses, so a code it lists is always one the find bar can find.
 
 ### Invariants worth knowing before editing
 
@@ -100,7 +100,7 @@ PyInstaller follows the imports from `main.py`, so the build needs no changes fo
 
 **Helical arcs need the K word.** K is the Z pitch per full 360° turn, *not* the Z travel of the block. `do_arc()` computes it from the whole arc's sweep and then splits the arc into `HELIX_MAX_DEG` pieces that all carry the same K. `check()` re-derives the expected Z travel from K and each piece's sweep and flags disagreement — if you change how arcs are split, that cross-check is what will catch it.
 
-**`BackplotParser` reads the converted output, not the input**, and must keep up with the converter's output shape: absolute I/J arcs (tessellated at `ARC_PLOT_DEG`), the native `G8x X Y Z(R) Z(depth) [Z(Q)]` block form taken from `CYCLE_TEMPLATES`, and modal XY continuation lines. Two deliberate inferences live there because the information is not in the output: M25's target Z is taken as the highest Z the program commands anywhere (pre-scanned in `_scan_z_home`), and a pure downward G01 Z move is coloured as a plunge (`_is_plunge`) so drilled holes stay visible under `CYCLE_MODE='expand'`.
+**`BackplotParser` reads the converted output, not the input**, and must keep up with the converter's output shape: absolute I/J arcs (tessellated at `ARC_PLOT_DEG`), the native `G8x X Y Z(depth) [Z(first peck) Z(peck)]` block form, whose depth is relative to the Z the cycle starts at (and whose Z words `_scan_z_home` must therefore skip), and modal XY continuation lines. A G00 that moves Z and XY together is drawn as two moves, Z first going up and XY first going down, which is how the firmware sequences it. Two deliberate inferences live there because the information is not in the output: M25's target Z is taken as the highest Z the program commands anywhere (pre-scanned in `_scan_z_home`), and a pure downward G01 Z move is coloured as a plunge (`_is_plunge`) so drilled holes stay visible under `CYCLE_MODE='expand'`.
 
 **Word parsing goes through the `WORD` regex.** Output blocks have no spaces (`N30X0.Y1.Z-0.0375I0.J0.K-0.15`), so letter-plus-number tokenising is the only safe way to read them — not ad-hoc per-letter searches. `fnum()` writes a trailing bare decimal point (`X5.`, `Z-0.3`), which is intentional: the decimal point is what keeps the control from reading the value as machine units.
 
@@ -108,12 +108,14 @@ PyInstaller follows the imports from `main.py`, so the build needs no changes fo
 
 The constants at the top of `main.py` are the machine-specific knobs, and several encode assumptions that are flagged in comments as needing confirmation on the actual machine:
 
-- `CYCLE_MODE` — `'expand'` (default) writes drilling as plain G00/G01 moves, matching the proven Fusion `hurcoBX.cps` post, which never sends G81–G85. `'native'` sends `G8x` blocks built from `CYCLE_TEMPLATES`. G84 tapping is always native.
-- `CYCLE_TEMPLATES` — which Z words follow `G8x X.. Y..`. G83 taking three Z words (R plane, depth, peck) is known; **the order and the other cycles' templates are assumptions.**
+- `CYCLE_MODE` — `'expand'` (default) writes drilling as plain G00/G01 moves, matching the proven Fusion `hurcoBX.cps` post, which never sends G81–G85. `'native'` sends `G8x` blocks built from `CYCLE_TEMPLATES`. Always native whatever the mode: G84 tapping, and G82/G89 when they carry a dwell, since the firmware only dwells inside those cycles.
+- `CYCLE_TEMPLATES` — the Z words of each native cycle, per the firmware: Z1 is the **total depth, unsigned, measured down from the Z the cycle starts at**; G83/G87 add Z2 (first peck, must be less than Z1) and Z3 (later pecks). **There is no R plane**: every hole retracts to the start Z. `native_cycle()` therefore rapids to the Fanuc R plane before the cycle block under G99, or starts from the initial Z under G98 (the first peck then covers the air gap); a change of parameters leaves with G80 and re-enters. The F in a cycle block sets a separate canned-feed register, so it never updates `last_feed_out`.
+- `DWELL_TICKS_PER_SEC` — dwells are written `G04/t` (the `/` word; P is not a BX address). The control's two help texts disagree on the unit (0.1 s or 0.01 s); **10 per second is an assumption to confirm.**
 - `HELIX_K` — `'signed'` (G75 mode, the power-up default) / `'unsigned'` (G74) / `None`. Without K the control gets helical Z motion wrong.
 - `HELIX_MAX_DEG`, `ARC_MAX_DEG`, `LINEARIZE_TOL` — arc splitting and G18/G19 linearization tolerance.
-- `ALLOWED_G` / `ALLOWED_M` — the BX-MPU vocabulary. Anything else is removed and reported as a warning, never raised.
-- `MAX_TOOL`, `RPM_RANGE`, `BUFFER_CHARS` — machine limits that produce warnings only.
+- `ALLOWED_G` / `ALLOWED_M` — what converted output may contain, a subset of the firmware's tables. Anything else is removed and reported as a warning, never raised. G09/G61/G64 (`REJECTED_G`) are on the AMTS sheet but not in the firmware, which answers them with BAD G CODE.
+- `MAX_TOOL` (12: this build's M06 limit), `RPM_RANGE` (40–3680, what the firmware accepts), `BUFFER_CHARS` — machine limits that produce warnings only. `MAX_FEED` (250 ipm / 6350 mm/min) is the exception: a higher F would stop the control, and a lower one is safe, so it is clamped.
+- `DEC` / `DEC_METRIC` — 4 decimals in inch, 3 in mm; `Converter.num()` picks by the current units. `N_MAX` (19999) — numbering starts again at `N_START` past it, with a warning.
 
 ### Conversion behaviour
 
@@ -121,8 +123,9 @@ The constants at the top of `main.py` are the machine-specific knobs, and severa
 - `G28`/`G30`/`G53` Z retracts → `M25`; XY home moves are dropped with a warning.
 - `G91` incremental moves and `G91.1` incremental I/J are resolved to absolute.
 - R-format arcs are converted to I/J; arcs in G18/G19 become short G01 moves.
-- Fanuc cycles with no Hurco equivalent are remapped via `CYCLE_MAP` (G73→G83, G74→G84, G76/G86–G89→G85) with a warning.
-- Unsupported codes (G43, G49, G54, G94, G98, H and D words …) are stripped and reported.
+- Fanuc cycles are remapped via `CYCLE_MAP` with a warning: G73→G87 (chip-break peck, expanded with a `CHIP_BREAK` back-off), G74→G84, G76→G86, G87/G88→G85. Fanuc G86 and G89 go to the BX cycles of the same number; expanded, G86 is feed in, M05, rapid out, spindle back on.
+- Unsupported codes (G43, G49, G54, G61, G94, G98, H and D words …) are stripped and reported. A D word must never reach the output: on the BX it stores a tool *diameter* and needs T in the same block.
+- M25 and M06 end any canned cycle (the firmware cancels it, and Z is unknown afterwards).
 - `M30`/`M02` triggers the end sequence; if the source has neither, one is appended with a warning.
 - Saving from the GUI writes ASCII with CRLF line endings, which is what the control expects over the DNC link.
 
